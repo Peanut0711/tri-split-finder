@@ -138,6 +138,98 @@ class TriSplitDetector:
             print(f"프레임 {frame_idx} 처리 중 오류: {e}")
         return frame_idx, False
 
+    def format_time(self, seconds):
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        seconds = seconds % 60
+        return f"{hours:02d}:{minutes:02d}:{seconds:06.3f}"
+
+    def find_precise_time(self, start_time, end_time, video_info, is_start=True):
+        """정밀한 시작/종료 시간을 찾습니다."""
+        search_range = 10  # 10초 범위 내에서 탐색
+        
+        if is_start:
+            search_start = max(0, start_time - search_range)
+            search_end = start_time
+            step = 1.0  # 1초 단위로 탐색
+        else:
+            search_start = end_time
+            search_end = min(video_info['duration'], end_time + search_range)
+            step = 1.0  # 1초 단위로 탐색
+        
+        best_time = start_time if is_start else end_time
+        best_ssim = 0
+        found_tri_split = False
+        consecutive_non_tri_split = 0  # 연속된 비-삼분할 프레임 카운트
+        
+        # 탐색 범위 내의 모든 프레임 검사
+        for current_time in np.arange(search_start, search_end, step):
+            frame_idx = int(current_time * video_info['fps'])
+            
+            # ffmpeg를 사용하여 특정 프레임 추출
+            cmd = [
+                "ffmpeg", "-y",
+                "-ss", str(current_time),
+                "-i", self.video_path,
+                "-vframes", "1",
+                "-f", "image2pipe",
+                "-vcodec", "rawvideo",
+                "-pix_fmt", "bgr24",
+                "-"
+            ]
+            
+            try:
+                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                frame_data, _ = process.communicate()
+                
+                if frame_data:
+                    frame = np.frombuffer(frame_data, dtype=np.uint8)
+                    frame = frame.reshape((video_info['height'], video_info['width'], 3))
+                    
+                    # 프레임 처리
+                    height, width = frame.shape[:2]
+                    if width == 3840:
+                        frame = frame[:, :1920]
+                        width = 1920
+                    
+                    section_width = width // 3
+                    left = frame[:, :section_width]
+                    center = frame[:, section_width:section_width*2]
+                    right = frame[:, section_width*2:]
+                    
+                    # SSIM 계산
+                    left_ssim = self.calculate_ssim(center, left)
+                    right_ssim = self.calculate_ssim(center, right)
+                    current_ssim = min(left_ssim, right_ssim)
+                    
+                    # 시작 시간 찾기: SSIM이 임계값을 넘는 첫 지점
+                    if is_start:
+                        if current_ssim >= self.ssim_threshold:
+                            best_time = current_time
+                            found_tri_split = True
+                            break
+                    # 종료 시간 찾기: 연속된 3개의 비-삼분할 프레임이 나오면 종료로 판단
+                    else:
+                        if current_ssim < self.ssim_threshold:
+                            consecutive_non_tri_split += 1
+                            if consecutive_non_tri_split >= 3:  # 3초 연속으로 삼분할이 아니면 종료로 판단
+                                best_time = current_time - 2  # 2초 전을 종료 시점으로 설정
+                                found_tri_split = True
+                                break
+                        else:
+                            consecutive_non_tri_split = 0
+                            best_ssim = max(best_ssim, current_ssim)
+            
+            except Exception as e:
+                print(f"정밀 시간 탐색 중 오류: {e}")
+                continue
+        
+        # 삼분할을 찾지 못한 경우 원래 시간 사용
+        if not found_tri_split:
+            return start_time if is_start else end_time
+            
+        return best_time
+
     def detect_tri_splits(self):
         start_total = time.time()
         timing_results = {}
@@ -182,10 +274,20 @@ class TriSplitDetector:
                     else:
                         if consecutive_count >= self.min_consecutive_frames:
                             end_time = current_time
+                            
+                            # 정밀한 시작/종료 시간 찾기
+                            print(f"\n구간 {len(tri_splits)+1} 정밀 시간 탐색 중...")
+                            precise_start = self.find_precise_time(start_time, end_time, video_info, is_start=True)
+                            precise_end = self.find_precise_time(start_time, end_time, video_info, is_start=False)
+                            
+                            # 시작 시간이 종료 시간보다 늦은 경우 처리
+                            if precise_start > precise_end:
+                                precise_end = precise_start + (end_time - start_time)
+                            
                             tri_splits.append({
-                                "start_time": round(start_time, 2),
-                                "end_time": round(end_time, 2),
-                                "duration": round(end_time - start_time, 2)
+                                "start_time": self.format_time(precise_start),
+                                "end_time": self.format_time(precise_end),
+                                "duration": round(precise_end - precise_start, 2)
                             })
                         consecutive_count = 0
                         start_time = None
@@ -197,10 +299,20 @@ class TriSplitDetector:
         # 마지막 구간 처리
         if consecutive_count >= self.min_consecutive_frames:
             end_time = frame_idx / fps
+            
+            # 정밀한 시작/종료 시간 찾기
+            print(f"\n구간 {len(tri_splits)+1} 정밀 시간 탐색 중...")
+            precise_start = self.find_precise_time(start_time, end_time, video_info, is_start=True)
+            precise_end = self.find_precise_time(start_time, end_time, video_info, is_start=False)
+            
+            # 시작 시간이 종료 시간보다 늦은 경우 처리
+            if precise_start > precise_end:
+                precise_end = precise_start + (end_time - start_time)
+            
             tri_splits.append({
-                "start_time": round(start_time, 2),
-                "end_time": round(end_time, 2),
-                "duration": round(end_time - start_time, 2)
+                "start_time": self.format_time(precise_start),
+                "end_time": self.format_time(precise_end),
+                "duration": round(precise_end - precise_start, 2)
             })
 
         timing_results['total'] = time.time() - start_total
@@ -280,7 +392,7 @@ def main():
     
     print(f"\n감지된 삼분할 구간: {len(tri_splits)}개")
     for i, split in enumerate(tri_splits, 1):
-        print(f"구간 {i}: {split['start_time']}초 ~ {split['end_time']}초 (지속시간: {split['duration']}초)")
+        print(f"구간 {i}: {split['start_time']} ~ {split['end_time']} (지속시간: {split['duration']}초)")
     
     if args.extract:
         print("\n구간 추출 중...")
