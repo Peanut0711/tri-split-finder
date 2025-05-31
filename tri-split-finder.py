@@ -9,6 +9,7 @@ import os
 import concurrent.futures
 import glob
 import shutil
+import time
 
 class TriSplitDetector:
     def __init__(self, video_path, output_json=None, min_duration=20, ssim_threshold=0.80, debug=False):
@@ -112,6 +113,7 @@ class TriSplitDetector:
             return False
 
     def detect_tri_splits(self):
+        start_total = time.time()
         video_info = self.get_video_info()
         frames_to_process = int(video_info['duration'] * self.frame_rate)
 
@@ -119,6 +121,7 @@ class TriSplitDetector:
         consecutive_count = 0
         start_time = None
         results = [None] * frames_to_process
+        timing_results = {}
 
         # 1. 임시 폴더 생성
         temp_dir = "_temp_frames"
@@ -127,7 +130,7 @@ class TriSplitDetector:
         os.makedirs(temp_dir, exist_ok=True)
 
         # 2. ffmpeg로 프레임 이미지 일괄 추출
-        # 예: frame_000001.png, frame_000002.png, ...
+        ffmpeg_start = time.time()
         ffmpeg_cmd = [
             "ffmpeg",
             "-i", self.video_path,
@@ -136,6 +139,7 @@ class TriSplitDetector:
         ]
         print("ffmpeg로 프레임 이미지 추출 중...")
         subprocess.run(ffmpeg_cmd, check=True)
+        timing_results['ffmpeg'] = time.time() - ffmpeg_start
 
         # 3. 이미지 파일 리스트
         frame_files = sorted(glob.glob(os.path.join(temp_dir, "frame_*.png")))
@@ -151,6 +155,7 @@ class TriSplitDetector:
                 return (idx, False)
 
         print("프레임 이미지 처리 중...")
+        process_start = time.time()
         with tqdm(total=len(frame_files), desc="프레임 처리 중") as pbar:
             with ThreadPoolExecutor(max_workers=24) as executor:
                 future_to_idx = {executor.submit(process_image, (idx, file)): idx for idx, file in enumerate(frame_files)}
@@ -158,8 +163,10 @@ class TriSplitDetector:
                     idx, is_tri_split = future.result()
                     results[idx] = is_tri_split
                     pbar.update(1)
+        timing_results['processing'] = time.time() - process_start
 
         # 4. 결과를 순차적으로 처리하여 구간 추출
+        analysis_start = time.time()
         for frame_idx, is_tri_split in enumerate(results):
             current_time = frame_idx / self.frame_rate
             if is_tri_split:
@@ -183,9 +190,24 @@ class TriSplitDetector:
                 "end_time": round(end_time, 2),
                 "duration": round(end_time - start_time, 2)
             })
+        timing_results['analysis'] = time.time() - analysis_start
 
         # 5. 임시 폴더 정리
+        cleanup_start = time.time()
         shutil.rmtree(temp_dir)
+        timing_results['cleanup'] = time.time() - cleanup_start
+
+        timing_results['total'] = time.time() - start_total
+
+        # 시간 측정 결과 출력
+        print("\n=== 처리 시간 요약 ===")
+        print(f"ffmpeg 프레임 추출: {timing_results['ffmpeg']:.2f}초")
+        print(f"프레임 이미지 처리: {timing_results['processing']:.2f}초")
+        print(f"구간 분석: {timing_results['analysis']:.2f}초")
+        print(f"임시 파일 정리: {timing_results['cleanup']:.2f}초")
+        print(f"전체 처리 시간: {timing_results['total']:.2f}초")
+        print("====================\n")
+
         return tri_splits
 
     def save_results(self, tri_splits):
@@ -202,7 +224,11 @@ class TriSplitDetector:
         with open(self.output_json, 'r', encoding='utf-8') as f:
             data = json.load(f)
             
+        extract_start = time.time()
+        segment_times = []
+        
         for i, segment in enumerate(data["tri_splits"]):
+            segment_start = time.time()
             output_path = os.path.join(output_dir, f"segment_{i+1}.mp4")
             cmd = [
                 "ffmpeg", "-y",
@@ -214,6 +240,16 @@ class TriSplitDetector:
                 output_path
             ]
             subprocess.run(cmd)
+            segment_times.append(time.time() - segment_start)
+        
+        total_extract_time = time.time() - extract_start
+        
+        # 구간 추출 시간 요약 출력
+        print("\n=== 구간 추출 시간 요약 ===")
+        for i, t in enumerate(segment_times, 1):
+            print(f"구간 {i} 추출: {t:.2f}초")
+        print(f"전체 구간 추출: {total_extract_time:.2f}초")
+        print("========================\n")
 
 def main():
     import argparse
