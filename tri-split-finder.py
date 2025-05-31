@@ -12,12 +12,12 @@ import shutil
 import time
 
 class TriSplitDetector:
-    def __init__(self, video_path, output_json=None, min_duration=20, ssim_threshold=0.80, debug=False):
+    def __init__(self, video_path, output_json=None, min_duration=30, ssim_threshold=0.80, debug=False):
         self.video_path = video_path
         self.output_json = output_json or f"{os.path.splitext(video_path)[0]}_tri_splits.json"
         self.min_duration = min_duration
         self.ssim_threshold = ssim_threshold
-        self.frame_rate = 1  # 1 FPS로 처리
+        self.frame_rate = 1/10  # 10초당 1프레임 (0.1 FPS)
         self.min_consecutive_frames = int(self.min_duration * self.frame_rate)
         self.debug = debug
         if debug:
@@ -115,7 +115,8 @@ class TriSplitDetector:
     def detect_tri_splits(self):
         start_total = time.time()
         video_info = self.get_video_info()
-        frames_to_process = int(video_info['duration'] * self.frame_rate)
+        total_duration = video_info['duration']
+        frames_to_process = int(total_duration * self.frame_rate) + 1  # +1 to ensure we have enough space
 
         tri_splits = []
         consecutive_count = 0
@@ -135,14 +136,15 @@ class TriSplitDetector:
             "ffmpeg",
             "-i", self.video_path,
             "-vf", f"fps={self.frame_rate}",
-            os.path.join(temp_dir, "frame_%06d.png")
+            "-q:v", "20",  # JPEG 품질 설정 (2-31, 낮을수록 고품질)
+            os.path.join(temp_dir, "frame_%06d.jpg")  # PNG에서 JPEG로 변경
         ]
         print("ffmpeg로 프레임 이미지 추출 중...")
         subprocess.run(ffmpeg_cmd, check=True)
         timing_results['ffmpeg'] = time.time() - ffmpeg_start
 
         # 3. 이미지 파일 리스트
-        frame_files = sorted(glob.glob(os.path.join(temp_dir, "frame_*.png")))
+        frame_files = sorted(glob.glob(os.path.join(temp_dir, "frame_*.jpg")))
 
         def process_image(idx_file):
             idx, file = idx_file
@@ -157,7 +159,7 @@ class TriSplitDetector:
         print("프레임 이미지 처리 중...")
         process_start = time.time()
         with tqdm(total=len(frame_files), desc="프레임 처리 중") as pbar:
-            with ThreadPoolExecutor(max_workers=24) as executor:
+            with ThreadPoolExecutor(max_workers=32) as executor:
                 future_to_idx = {executor.submit(process_image, (idx, file)): idx for idx, file in enumerate(frame_files)}
                 for future in concurrent.futures.as_completed(future_to_idx):
                     idx, is_tri_split = future.result()
