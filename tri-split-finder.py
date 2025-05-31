@@ -112,6 +112,32 @@ class TriSplitDetector:
             print(f"프레임 처리 중 오류 발생: {e}")
             return False
 
+    def process_frame_parallel(self, frame_idx, video_info):
+        try:
+            # ffmpeg를 사용하여 특정 프레임 추출
+            cmd = [
+                "ffmpeg", "-y",
+                "-ss", str(frame_idx / video_info['fps']),
+                "-i", self.video_path,
+                "-vframes", "1",
+                "-f", "image2pipe",
+                "-vcodec", "rawvideo",
+                "-pix_fmt", "bgr24",
+                "-"
+            ]
+            
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            frame_data, _ = process.communicate()
+            
+            if frame_data:
+                frame = np.frombuffer(frame_data, dtype=np.uint8)
+                frame = frame.reshape((video_info['height'], video_info['width'], 3))
+                is_tri_split = self.process_frame(frame, frame_idx)
+                return frame_idx, is_tri_split
+        except Exception as e:
+            print(f"프레임 {frame_idx} 처리 중 오류: {e}")
+        return frame_idx, False
+
     def detect_tri_splits(self):
         start_total = time.time()
         timing_results = {}
@@ -132,52 +158,39 @@ class TriSplitDetector:
         print("프레임 처리 중...")
         process_start = time.time()
         
+        # 병렬 처리를 위한 프레임 인덱스 리스트 생성
+        frame_indices = list(range(0, total_frames, frame_interval))
+        
         with tqdm(total=target_frames, desc="프레임 처리 중") as pbar:
-            for frame_idx in range(0, total_frames, frame_interval):
-                # ffmpeg를 사용하여 특정 프레임 추출
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-ss", str(frame_idx / fps),
-                    "-i", self.video_path,
-                    "-vframes", "1",
-                    "-f", "image2pipe",
-                    "-vcodec", "rawvideo",
-                    "-pix_fmt", "bgr24",
-                    "-"
-                ]
+            # ThreadPoolExecutor를 사용하여 병렬 처리
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                # 각 프레임에 대한 작업 제출
+                future_to_frame = {
+                    executor.submit(self.process_frame_parallel, frame_idx, video_info): frame_idx 
+                    for frame_idx in frame_indices
+                }
                 
-                try:
-                    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    frame_data, _ = process.communicate()
+                # 결과 수집
+                for future in concurrent.futures.as_completed(future_to_frame):
+                    frame_idx, is_tri_split = future.result()
+                    current_time = frame_idx / fps
                     
-                    if frame_data:
-                        # raw video 데이터를 numpy 배열로 변환
-                        frame = np.frombuffer(frame_data, dtype=np.uint8)
-                        frame = frame.reshape((video_info['height'], video_info['width'], 3))
-                        
-                        # 프레임 처리
-                        is_tri_split = self.process_frame(frame, frame_idx)
-                        current_time = frame_idx / fps
-                        
-                        if is_tri_split:
-                            if consecutive_count == 0:
-                                start_time = current_time
-                            consecutive_count += 1
-                        else:
-                            if consecutive_count >= self.min_consecutive_frames:
-                                end_time = current_time
-                                tri_splits.append({
-                                    "start_time": round(start_time, 2),
-                                    "end_time": round(end_time, 2),
-                                    "duration": round(end_time - start_time, 2)
-                                })
-                            consecutive_count = 0
-                            start_time = None
-                except Exception as e:
-                    print(f"프레임 {frame_idx} 처리 중 오류: {e}")
-                    continue
-                
-                pbar.update(1)
+                    if is_tri_split:
+                        if consecutive_count == 0:
+                            start_time = current_time
+                        consecutive_count += 1
+                    else:
+                        if consecutive_count >= self.min_consecutive_frames:
+                            end_time = current_time
+                            tri_splits.append({
+                                "start_time": round(start_time, 2),
+                                "end_time": round(end_time, 2),
+                                "duration": round(end_time - start_time, 2)
+                            })
+                        consecutive_count = 0
+                        start_time = None
+                    
+                    pbar.update(1)
         
         timing_results['processing'] = time.time() - process_start
 
