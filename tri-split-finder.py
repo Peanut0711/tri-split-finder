@@ -114,104 +114,87 @@ class TriSplitDetector:
 
     def detect_tri_splits(self):
         start_total = time.time()
-        video_info = self.get_video_info()
-        total_duration = video_info['duration']
-        frames_to_process = int(total_duration * self.frame_rate) + 1  # +1 to ensure we have enough space
+        timing_results = {}
 
+        # 1. 비디오 정보 가져오기
+        video_info = self.get_video_info()
+        fps = video_info['fps']
+        total_frames = int(video_info['duration'] * fps)
+        
+        # 10초당 한 프레임만 처리하도록 설정
+        frame_interval = int(fps * 10)
+        target_frames = total_frames // frame_interval
+        
         tri_splits = []
         consecutive_count = 0
         start_time = None
-        results = [None] * frames_to_process
-        timing_results = {}
-
-        # 1. 임시 폴더 생성
-        temp_dir = "_temp_frames"
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
-        os.makedirs(temp_dir, exist_ok=True)
-
-        # 2. ffmpeg로 프레임 이미지 일괄 추출
-        ffmpeg_start = time.time()
-        ffmpeg_cmd = [
-            "ffmpeg",
-            "-i", self.video_path,
-            "-vf", f"fps={self.frame_rate}",
-            "-q:v", "20",  # JPEG 품질 설정 (2-31, 낮을수록 고품질)
-            "-thread_queue_size", "16384",  # 스레드 큐 크기 대폭 증가 (48GB 메모리의 10% 활용)
-            "-max_muxing_queue_size", "16384",  # 멀티플렉싱 큐 크기 대폭 증가
-            "-probesize", "512M",  # 프로브 크기 대폭 증가
-            "-analyzeduration", "0",  # 분석 시간 최소화
-            "-threads", "0",  # 모든 CPU 코어 사용
-            os.path.join(temp_dir, "frame_%06d.jpg")  # PNG에서 JPEG로 변경
-        ]
-        print("ffmpeg로 프레임 이미지 추출 중...")
-        subprocess.run(ffmpeg_cmd, check=True)
-        timing_results['ffmpeg'] = time.time() - ffmpeg_start
-
-        # 3. 이미지 파일 리스트
-        frame_files = sorted(glob.glob(os.path.join(temp_dir, "frame_*.jpg")))
-
-        def process_image(idx_file):
-            idx, file = idx_file
-            try:
-                frame = cv2.imread(file)
-                is_tri_split = self.process_frame(frame, idx)
-                return (idx, is_tri_split)
-            except Exception as e:
-                print(f"프레임 {idx} 처리 중 오류 발생: {e}")
-                return (idx, False)
-
-        print("프레임 이미지 처리 중...")
+        
+        print("프레임 처리 중...")
         process_start = time.time()
-        with tqdm(total=len(frame_files), desc="프레임 처리 중") as pbar:
-            with ThreadPoolExecutor(max_workers=32) as executor:
-                future_to_idx = {executor.submit(process_image, (idx, file)): idx for idx, file in enumerate(frame_files)}
-                for future in concurrent.futures.as_completed(future_to_idx):
-                    idx, is_tri_split = future.result()
-                    results[idx] = is_tri_split
-                    pbar.update(1)
+        
+        with tqdm(total=target_frames, desc="프레임 처리 중") as pbar:
+            for frame_idx in range(0, total_frames, frame_interval):
+                # ffmpeg를 사용하여 특정 프레임 추출
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-ss", str(frame_idx / fps),
+                    "-i", self.video_path,
+                    "-vframes", "1",
+                    "-f", "image2pipe",
+                    "-vcodec", "rawvideo",
+                    "-pix_fmt", "bgr24",
+                    "-"
+                ]
+                
+                try:
+                    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    frame_data, _ = process.communicate()
+                    
+                    if frame_data:
+                        # raw video 데이터를 numpy 배열로 변환
+                        frame = np.frombuffer(frame_data, dtype=np.uint8)
+                        frame = frame.reshape((video_info['height'], video_info['width'], 3))
+                        
+                        # 프레임 처리
+                        is_tri_split = self.process_frame(frame, frame_idx)
+                        current_time = frame_idx / fps
+                        
+                        if is_tri_split:
+                            if consecutive_count == 0:
+                                start_time = current_time
+                            consecutive_count += 1
+                        else:
+                            if consecutive_count >= self.min_consecutive_frames:
+                                end_time = current_time
+                                tri_splits.append({
+                                    "start_time": round(start_time, 2),
+                                    "end_time": round(end_time, 2),
+                                    "duration": round(end_time - start_time, 2)
+                                })
+                            consecutive_count = 0
+                            start_time = None
+                except Exception as e:
+                    print(f"프레임 {frame_idx} 처리 중 오류: {e}")
+                    continue
+                
+                pbar.update(1)
+        
         timing_results['processing'] = time.time() - process_start
 
-        # 4. 결과를 순차적으로 처리하여 구간 추출
-        analysis_start = time.time()
-        for frame_idx, is_tri_split in enumerate(results):
-            current_time = frame_idx / self.frame_rate
-            if is_tri_split:
-                if consecutive_count == 0:
-                    start_time = current_time
-                consecutive_count += 1
-            else:
-                if consecutive_count >= self.min_consecutive_frames:
-                    end_time = current_time
-                    tri_splits.append({
-                        "start_time": round(start_time, 2),
-                        "end_time": round(end_time, 2),
-                        "duration": round(end_time - start_time, 2)
-                    })
-                consecutive_count = 0
-                start_time = None
+        # 마지막 구간 처리
         if consecutive_count >= self.min_consecutive_frames:
-            end_time = frames_to_process / self.frame_rate
+            end_time = frame_idx / fps
             tri_splits.append({
                 "start_time": round(start_time, 2),
                 "end_time": round(end_time, 2),
                 "duration": round(end_time - start_time, 2)
             })
-        timing_results['analysis'] = time.time() - analysis_start
-
-        # 5. 임시 폴더 정리
-        cleanup_start = time.time()
-        shutil.rmtree(temp_dir)
-        timing_results['cleanup'] = time.time() - cleanup_start
 
         timing_results['total'] = time.time() - start_total
 
         # 시간 측정 결과 출력
         print("\n=== 처리 시간 요약 ===")
-        print(f"ffmpeg 프레임 추출: {timing_results['ffmpeg']:.2f}초")
-        print(f"프레임 이미지 처리: {timing_results['processing']:.2f}초")
-        print(f"구간 분석: {timing_results['analysis']:.2f}초")
-        print(f"임시 파일 정리: {timing_results['cleanup']:.2f}초")
+        print(f"프레임 처리: {timing_results['processing']:.2f}초")
         print(f"전체 처리 시간: {timing_results['total']:.2f}초")
         print("====================\n")
 
