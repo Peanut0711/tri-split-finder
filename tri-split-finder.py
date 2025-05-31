@@ -161,6 +161,7 @@ class TriSplitDetector:
         best_ssim = 0
         found_tri_split = False
         consecutive_non_tri_split = 0  # 연속된 비-삼분할 프레임 카운트
+        last_tri_split_time = None  # 마지막으로 발견된 삼분할 시간
         
         # 탐색 범위 내의 모든 프레임 검사
         for current_time in np.arange(search_start, search_end, step):
@@ -210,15 +211,19 @@ class TriSplitDetector:
                             break
                     # 종료 시간 찾기: 연속된 3개의 비-삼분할 프레임이 나오면 종료로 판단
                     else:
-                        if current_ssim < self.ssim_threshold:
+                        if current_ssim >= self.ssim_threshold:
+                            consecutive_non_tri_split = 0
+                            last_tri_split_time = current_time
+                            best_ssim = max(best_ssim, current_ssim)
+                        else:
                             consecutive_non_tri_split += 1
                             if consecutive_non_tri_split >= 3:  # 3초 연속으로 삼분할이 아니면 종료로 판단
-                                best_time = current_time - 2  # 2초 전을 종료 시점으로 설정
+                                if last_tri_split_time is not None:
+                                    best_time = last_tri_split_time
+                                else:
+                                    best_time = current_time - 2  # 2초 전을 종료 시점으로 설정
                                 found_tri_split = True
                                 break
-                        else:
-                            consecutive_non_tri_split = 0
-                            best_ssim = max(best_ssim, current_ssim)
             
             except Exception as e:
                 print(f"정밀 시간 탐색 중 오류: {e}")
@@ -392,7 +397,7 @@ def main():
     
     print(f"\n감지된 삼분할 구간: {len(tri_splits)}개")
     for i, split in enumerate(tri_splits, 1):
-        print(f"구간 {i}: {split['start_time']} ~ {split['end_time']} (지속시간: {split['duration']}초)")
+        print(f"구간 {i}: {split['start_time']} - {split['end_time']} (지속시간: {split['duration']}초)")
     
     if args.extract:
         print("\n구간 추출 중...")
