@@ -67,13 +67,16 @@ class TriSplitDetector:
             
         # 프레임을 3등분
         height, width = frame.shape[:2]
-        left = frame[:, :640]
-        center = frame[:, 640:1280]
-        right = frame[:, 1280:]
+        center_y = height // 2
+        band_start = center_y - 15
+        band_end = center_y + 15
         
         # 디버그 이미지 생성
         debug_img = np.zeros((height, width * 2, 3), dtype=np.uint8)
         debug_img[:, :width] = frame
+        
+        # 비교 밴드 표시
+        cv2.rectangle(debug_img, (0, band_start), (width, band_end), (0, 255, 0), 2)
         
         # SSIM 값 표시
         cv2.putText(debug_img, f"Left SSIM: {left_ssim:.3f}", (10, 30), 
@@ -95,16 +98,30 @@ class TriSplitDetector:
             if width == 3840:
                 frame = frame[:, :1920]
                 width = 1920
-            # 프레임을 3등분
-            left = frame[:, :640]
-            center = frame[:, 640:1280]
-            right = frame[:, 1280:]
+
+            # 세로 중앙 ±15픽셀 범위의 수평 밴드 추출 (y=525~555)
+            center_y = height // 2
+            band_start = center_y - 15
+            band_end = center_y + 15
+            horizontal_band = frame[band_start:band_end, :]
+            
+            # 밴드를 3등분
+            section_width = width // 3
+            left = horizontal_band[:, :section_width]
+            center = horizontal_band[:, section_width:section_width*2]
+            right = horizontal_band[:, section_width*2:]
             
             # SSIM 계산
             left_ssim = self.calculate_ssim(center, left)
             right_ssim = self.calculate_ssim(center, right)
             
             if self.debug:
+                print(f"\n프레임 {frame_idx} 처리:")
+                print(f"이미지 크기: {width}x{height}")
+                print(f"밴드 위치: y={band_start}~{band_end}")
+                print(f"Left SSIM: {left_ssim:.3f}")
+                print(f"Right SSIM: {right_ssim:.3f}")
+                print(f"임계값: {self.ssim_threshold}")
                 self.save_debug_frame(frame, left_ssim, right_ssim, frame_idx)
             
             return left_ssim >= self.ssim_threshold and right_ssim >= self.ssim_threshold
@@ -134,6 +151,9 @@ class TriSplitDetector:
                 frame = frame.reshape((video_info['height'], video_info['width'], 3))
                 is_tri_split = self.process_frame(frame, frame_idx)
                 return frame_idx, is_tri_split
+            else:
+                if self.debug:
+                    print(f"프레임 {frame_idx} 데이터 추출 실패")
         except Exception as e:
             print(f"프레임 {frame_idx} 처리 중 오류: {e}")
         return frame_idx, False
@@ -241,12 +261,23 @@ class TriSplitDetector:
 
         # 1. 비디오 정보 가져오기
         video_info = self.get_video_info()
+        if self.debug:
+            print("\n=== 비디오 정보 ===")
+            print(f"해상도: {video_info['width']}x{video_info['height']}")
+            print(f"FPS: {video_info['fps']}")
+            print(f"길이: {video_info['duration']}초")
+            print("==================\n")
+        
         fps = video_info['fps']
         total_frames = int(video_info['duration'] * fps)
         
         # 10초당 한 프레임만 처리하도록 설정
         frame_interval = int(fps * 10)
         target_frames = total_frames // frame_interval
+        
+        if self.debug:
+            print(f"처리할 총 프레임 수: {target_frames}")
+            print(f"프레임 간격: {frame_interval} (10초)")
         
         tri_splits = []
         consecutive_count = 0
@@ -275,10 +306,15 @@ class TriSplitDetector:
                     if is_tri_split:
                         if consecutive_count == 0:
                             start_time = current_time
+                            if self.debug:
+                                print(f"\n삼분할 시작 감지: {self.format_time(current_time)}")
                         consecutive_count += 1
                     else:
                         if consecutive_count >= self.min_consecutive_frames:
                             end_time = current_time
+                            if self.debug:
+                                print(f"삼분할 종료 감지: {self.format_time(current_time)}")
+                                print(f"연속 프레임 수: {consecutive_count}")
                             
                             # 정밀한 시작/종료 시간 찾기
                             print(f"\n구간 {len(tri_splits)+1} 정밀 시간 탐색 중...")
