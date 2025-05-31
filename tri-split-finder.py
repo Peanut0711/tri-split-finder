@@ -137,6 +137,11 @@ class TriSplitDetector:
             "-i", self.video_path,
             "-vf", f"fps={self.frame_rate}",
             "-q:v", "20",  # JPEG 품질 설정 (2-31, 낮을수록 고품질)
+            "-thread_queue_size", "16384",  # 스레드 큐 크기 대폭 증가 (48GB 메모리의 10% 활용)
+            "-max_muxing_queue_size", "16384",  # 멀티플렉싱 큐 크기 대폭 증가
+            "-probesize", "512M",  # 프로브 크기 대폭 증가
+            "-analyzeduration", "0",  # 분석 시간 최소화
+            "-threads", "0",  # 모든 CPU 코어 사용
             os.path.join(temp_dir, "frame_%06d.jpg")  # PNG에서 JPEG로 변경
         ]
         print("ffmpeg로 프레임 이미지 추출 중...")
