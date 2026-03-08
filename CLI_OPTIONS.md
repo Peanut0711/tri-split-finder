@@ -36,6 +36,13 @@ python tripartite_section_check.py <input> [옵션...]
 | `--coarse-interval SEC` | float | 30.0 | 코스 스캔 간격(초). 작을수록 촘촘, 클수록 성김 |
 | `--workers N` | int | CPU 코어 수 | 코스 스캔에 쓸 병렬 프로세스 수. 1이면 순차 처리 |
 
+### 구간 병합 (코덱 카피)
+
+| 옵션 | 설명 |
+|------|------|
+| `--merge` | 검출된 구간만 코덱 카피로 잘라 한 파일로 이어붙여 저장. **인자 없으면** 원본과 같은 폴더에 **원본파일명_merged.mp4** 로 저장. |
+| `--merge OUTPUT` | 위와 동일하되, **OUTPUT**에 절대경로·파일명을 주면 그 위치에 저장. 예: `--merge "F:\세경\result.mp4"` |
+
 ### GPU
 
 | 옵션 | 설명 |
@@ -80,6 +87,12 @@ python tripartite_section_check.py "video.ts" --verify 02:21:48.357 02:24:00.679
 
 # 검증 + 이미지 저장 (OK/NG 모두, 최대 20개)
 python tripartite_section_check.py "video.ts" --verify 02:21:48 02:24:00 --verify-export "F:\export"
+
+# 검출 후 구간만 병합: 인자 없으면 같은 폴더에 video_merged.mp4 생성
+python tripartite_section_check.py "F:\세경\video.ts" --cuda --merge
+
+# 병합 결과를 지정 경로/파일명으로 저장
+python tripartite_section_check.py "F:\세경\video.ts" --cuda --merge "F:\세경\result.mp4"
 
 # 검증 + NG 시점만 이미지 무제한 저장
 python tripartite_section_check.py "video.ts" --cuda --verify 02:21:48.357 02:24:00.679 --verify-export "F:\export" --verify-export-only-x --verify-export-max 0

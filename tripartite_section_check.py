@@ -15,6 +15,7 @@ import argparse
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
@@ -783,6 +784,72 @@ def find_segments(
     return (result, timings)
 
 
+def merge_segments(
+    path: Path,
+    segments: list[tuple[float, float]],
+    output_path: Path,
+    use_gpu: bool = False,
+) -> bool:
+    """
+    구간 목록을 ffmpeg로 코덱 카피(-c copy)해 잘라 임시 파일로 만든 뒤,
+    concat demuxer로 한 파일로 이어붙여 output_path에 저장.
+    성공 시 True, 실패 시 False.
+    """
+    if not segments:
+        return False
+    output_path = output_path.resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    tmpdir = Path(tempfile.mkdtemp(prefix="tripartite_merge_", dir=str(output_path.parent)))
+    merge_start = time.perf_counter()
+    try:
+        list_path = tmpdir / "list.txt"
+        path_str = str(path.resolve())
+        for i, (start, end) in enumerate(segments):
+            seg_path = tmpdir / f"segment_{i + 1:04d}.ts"
+            duration = end - start
+            seg_start = time.perf_counter()
+            cmd = ["ffmpeg", "-y"]
+            if use_gpu:
+                cmd.extend(["-hwaccel", "cuda"])
+            cmd.extend([
+                "-ss", str(start), "-i", path_str,
+                "-t", str(duration), "-c", "copy",
+                "-avoid_negative_ts", "make_zero",
+                str(seg_path),
+            ])
+            ret = subprocess.run(cmd, capture_output=True, timeout=3600)
+            seg_elapsed = time.perf_counter() - seg_start
+            if ret.returncode != 0 or not seg_path.is_file():
+                print(f"[오류] 구간 [{i + 1}] 추출 실패: {format_ts(start)} ~ {format_ts(end)}", file=sys.stderr)
+                return False
+            print(f"  구간 [{i + 1}/{len(segments)}]  {format_ts(start)} ~ {format_ts(end)}  (길이 {duration:.1f}초)  소요 {seg_elapsed:.1f}초", flush=True)
+        with open(list_path, "w", encoding="utf-8") as f:
+            for i in range(len(segments)):
+                seg_name = f"segment_{i + 1:04d}.ts"
+                f.write(f"file '{seg_name}'\n")
+        concat_start = time.perf_counter()
+        cmd_concat = [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", str(list_path), "-c", "copy", str(output_path),
+        ]
+        ret = subprocess.run(cmd_concat, capture_output=True, timeout=3600, cwd=str(tmpdir))
+        concat_elapsed = time.perf_counter() - concat_start
+        if ret.returncode != 0 or not output_path.is_file():
+            print("[오류] 구간 합치기(concat) 실패", file=sys.stderr)
+            return False
+        total_elapsed = time.perf_counter() - merge_start
+        print(f"  concat 합치기  소요 {concat_elapsed:.1f}초", flush=True)
+        print(f"병합 완료: {output_path}  (총 {len(segments)}개 구간, 병합 총 소요 {total_elapsed:.1f}초)", flush=True)
+        return True
+    finally:
+        try:
+            for f in tmpdir.iterdir():
+                f.unlink(missing_ok=True)
+            tmpdir.rmdir()
+        except OSError:
+            pass
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="영상에서 삼분할 구간 검출 (y 중앙부 샘플)")
     parser.add_argument("input", type=Path, help="입력 영상 파일 (예: input.ts)")
@@ -842,6 +909,14 @@ def main() -> None:
         "--verify-export-only-x",
         action="store_true",
         help="--verify-export 시 삼분할 X(불일치)로 판정된 시점만 이미지 저장",
+    )
+    parser.add_argument(
+        "--merge",
+        nargs="?",
+        const=True,
+        default=None,
+        metavar="OUTPUT",
+        help="검출된 구간만 코덱 카피로 잘라서 한 파일로 이어붙여 저장. 인자 없으면 원본과 같은 폴더에 원본파일명_merged.mp4 로 저장. 경로/파일명을 주면 그 위치에 저장. 예: --merge 또는 --merge F:\\세경\\result.mp4",
     )
     args = parser.parse_args()
 
@@ -940,6 +1015,16 @@ def main() -> None:
         print(f"  [{i}] {format_ts(start)} ~ {format_ts(end)}  (길이 {end - start:.1f}초)")
     print("-" * 50)
     print(f"총 {len(segments)}개 구간  (전체 소요: {_format_elapsed(run_elapsed)})")
+
+    if args.merge is not None:
+        output_path = (
+            Path(args.merge).resolve()
+            if args.merge is not True
+            else path.parent / (path.stem + "_merged.mp4")
+        )
+        print(f"구간 병합 중... (코덱 카피) → {output_path}", flush=True)
+        if not merge_segments(path, segments, output_path, use_gpu):
+            sys.exit(1)
 
 
 if __name__ == "__main__":
