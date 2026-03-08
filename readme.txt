@@ -6,3 +6,9 @@ python tripartite_section_check.py "F:\세경\video.ts" --cuda --segments-out "F
 
 # 10번 구간만 빼고 병합하려면: segments.txt에서 10번째 구간 줄을 삭제하거나 # 처리
 python tripartite_section_check.py "F:\세경\video.ts" --segments-in "F:\세경\segments.txt" --merge
+
+# 1) 구간 검출 후 같은 폴더에 video_seg.txt 저장
+python tripartite_section_check.py "F:\세경\video.ts" --cuda --segments-out
+
+# 2) video_seg.txt 편집 후, 인자 없이 같은 폴더의 video_seg.txt 로 병합
+python tripartite_section_check.py "F:\세경\video.ts" --segments-in --merge

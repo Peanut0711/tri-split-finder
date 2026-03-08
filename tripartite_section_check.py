@@ -969,17 +969,19 @@ def main() -> None:
     )
     parser.add_argument(
         "--segments-out",
-        type=Path,
+        nargs="?",
+        const=True,
         default=None,
         metavar="FILE",
-        help="검출된 구간 목록을 텍스트 파일로 저장. 한 줄에 '시작 시각 끝 시각'. 나중에 편집 후 --segments-in으로 읽어 병합 가능",
+        help="검출된 구간 목록을 텍스트 파일로 저장. 인자 없으면 원본과 같은 폴더에 원본파일명_seg.txt 로 저장. 경로 지정 시 그 위치에 저장",
     )
     parser.add_argument(
         "--segments-in",
-        type=Path,
+        nargs="?",
+        const=True,
         default=None,
         metavar="FILE",
-        help="구간 검출 대신 파일에서 구간 목록 읽기. 빈 줄·# 줄 무시. 원하는 구간만 남기고 저장한 뒤 --segments-in FILE --merge 로 병합",
+        help="구간 검출 대신 파일에서 구간 목록 읽기. 인자 없으면 원본과 같은 폴더의 원본파일명_seg.txt 사용. 빈 줄·# 줄 무시",
     )
     args = parser.parse_args()
 
@@ -994,8 +996,16 @@ def main() -> None:
 
     # --segments-in: 파일에서 구간 목록 읽어서 출력·병합만 (검출 생략)
     if segments_in is not None:
+        seg_file = (
+            path.parent / (path.stem + "_seg.txt")
+            if segments_in is True
+            else Path(segments_in).resolve()
+        )
+        if not seg_file.is_file():
+            print(f"[오류] 구간 목록 파일을 찾을 수 없습니다: {seg_file}", file=sys.stderr)
+            sys.exit(1)
         try:
-            segments = load_segments_from_file(segments_in)
+            segments = load_segments_from_file(seg_file)
         except FileNotFoundError as e:
             print(f"[오류] {e}", file=sys.stderr)
             sys.exit(1)
@@ -1003,7 +1013,7 @@ def main() -> None:
             print("[오류] 구간 목록 파일에 유효한 구간이 없습니다.", file=sys.stderr)
             sys.exit(1)
         print(f"입력: {path}")
-        print(f"구간 목록: {segments_in}  (총 {len(segments)}개)")
+        print(f"구간 목록: {seg_file}  (총 {len(segments)}개)")
         print("삼분할 구간:")
         for i, (start, end) in enumerate(segments, 1):
             print(f"  [{i}] {format_ts(start)} ~ {format_ts(end)}  (길이 {end - start:.1f}초)")
@@ -1110,8 +1120,13 @@ def main() -> None:
     print(f"총 {len(segments)}개 구간  (전체 소요: {_format_elapsed(run_elapsed)})")
 
     if segments_out is not None:
-        write_segments_to_file(segments, segments_out)
-        print(f"구간 목록 저장: {segments_out}  (편집 후 --segments-in으로 읽어 병합 가능)", flush=True)
+        out_path = (
+            path.parent / (path.stem + "_seg.txt")
+            if segments_out is True
+            else Path(segments_out).resolve()
+        )
+        write_segments_to_file(segments, out_path)
+        print(f"구간 목록 저장: {out_path}  (편집 후 --segments-in으로 읽어 병합 가능)", flush=True)
 
     if args.merge is not None:
         output_path = (
