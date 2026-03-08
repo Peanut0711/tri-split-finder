@@ -45,6 +45,8 @@ BOUNDARY_TOLERANCE = 0.5  # 경계 이진 탐색 정밀도(초). 지시사항: 0
 Y_CROP_RATIO_START = 0.35  # 높이 상 35% 지점부터 샘플 (상단 팝업 제외)
 Y_CROP_RATIO_END = 0.65  # 높이 상 65% 지점까지 샘플 (중앙부만 사용)
 MSE_THRESHOLD = 500.0  # 이 값 이하면 좌=우 동일으로 간주 (튜닝 가능)
+# 송출자가 가상선을 640/1280 대신 647/1273 등으로 그린 경우 대비: 경계를 ±N픽셀 옮겨 보며 MSE 최소인 정렬 탐색
+ALIGN_TOLERANCE_PX = 10  # 0이면 고정 1/3·2/3만 사용, 10이면 w/3±10 픽셀 범위에서 최적 좌/우 너비 탐색
 MIN_SEGMENT_DURATION = 20.0  # 최소 구간 길이(초), 이보다 짧으면 구간으로 인정 안 함(선택)
 MERGE_GAP_SECONDS = 10.0  # 인접 구간이 이 시간(초) 이내면 하나로 병합
 # 중앙에만 효과(꽃잎 등)가 있는 삼분할: 좌·우 동일성만 비교. strict면 좌=중앙=우 모두 비교.
@@ -128,6 +130,17 @@ def split_third(region: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]
     return left, center, right
 
 
+def split_third_with_left_width(
+    region: np.ndarray, left_width: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """좌/우 너비를 left_width로 해서 왼쪽·중앙·오른쪽 영역 반환. (정렬 허용 시 사용)"""
+    w = region.shape[1]
+    left = region[:, :left_width]
+    center = region[:, left_width : w - left_width]
+    right = region[:, w - left_width :]
+    return left, center, right
+
+
 def mse(a: np.ndarray, b: np.ndarray) -> float:
     """Mean Squared Error. 두 영역 크기가 같아야 함."""
     if a.shape != b.shape:
@@ -143,33 +156,67 @@ def _is_tripartite_frame_gpu(frame: np.ndarray, left_right_only: bool) -> bool:
     y0 = int(h * Y_CROP_RATIO_START)
     y1 = int(h * Y_CROP_RATIO_END)
     g = cp.asarray(frame[y0:y1, :])
-    third = g.shape[1] // 3
-    left = g[:, :third]
-    center = g[:, third : 2 * third]
-    right = g[:, 2 * third :]
-    min_w = min(left.shape[1], center.shape[1], right.shape[1])
-    left = left[:, :min_w].astype(cp.float64)
-    right = right[:, :min_w].astype(cp.float64)
-    if left_right_only:
-        mse_val = float(cp.mean((left - right) ** 2).item())
-        return mse_val <= MSE_THRESHOLD
-    center = center[:, :min_w].astype(cp.float64)
-    mse_lc = float(cp.mean((left - center) ** 2).item())
-    mse_rc = float(cp.mean((right - center) ** 2).item())
-    return mse_lc <= MSE_THRESHOLD and mse_rc <= MSE_THRESHOLD
+    crop_w = g.shape[1]
+    base = crop_w // 3
+    tol = ALIGN_TOLERANCE_PX
+    if tol <= 0:
+        L_vals = [base]
+    else:
+        L_vals = range(
+            max(1, base - tol),
+            min(crop_w // 2, base + tol + 1),
+        )
+    for L in L_vals:
+        if crop_w - L < 1:
+            continue
+        left = g[:, :L].astype(cp.float64)
+        right = g[:, crop_w - L :].astype(cp.float64)
+        if left_right_only:
+            mse_val = float(cp.mean((left - right) ** 2).item())
+            if mse_val <= MSE_THRESHOLD:
+                return True
+        else:
+            center = g[:, L : crop_w - L].astype(cp.float64)
+            min_c = min(left.shape[1], center.shape[1], right.shape[1])
+            if min_c < 1:
+                continue
+            lc = left[:, :min_c]
+            cc = center[:, :min_c]
+            rc = right[:, :min_c]
+            mse_lc = float(cp.mean((lc - cc) ** 2).item())
+            mse_rc = float(cp.mean((rc - cc) ** 2).item())
+            if mse_lc <= MSE_THRESHOLD and mse_rc <= MSE_THRESHOLD:
+                return True
+    return False
 
 
 def _is_tripartite_frame_cpu(frame: np.ndarray, left_right_only: bool) -> bool:
-    """CPU(NumPy) 경로."""
+    """CPU(NumPy) 경로. ALIGN_TOLERANCE_PX > 0이면 경계를 ±N픽셀 옮겨 보며 최적 정렬 탐색."""
     cropped = crop_middle_y(frame)
-    left, center, right = split_third(cropped)
-    min_w = min(left.shape[1], center.shape[1], right.shape[1])
-    left = left[:, :min_w]
-    center = center[:, :min_w]
-    right = right[:, :min_w]
-    if left_right_only:
-        return mse(left, right) <= MSE_THRESHOLD
-    return mse(left, center) <= MSE_THRESHOLD and mse(right, center) <= MSE_THRESHOLD
+    w = cropped.shape[1]
+    base = w // 3
+    tol = ALIGN_TOLERANCE_PX
+    if tol <= 0:
+        L_vals = [base]
+    else:
+        L_vals = range(max(1, base - tol), min(w // 2, base + tol + 1))
+    for L in L_vals:
+        if w - L < 1:
+            continue
+        left, center, right = split_third_with_left_width(cropped, L)
+        min_w = min(left.shape[1], center.shape[1], right.shape[1])
+        if min_w < 1:
+            continue
+        left = left[:, :min_w]
+        center = center[:, :min_w]
+        right = right[:, :min_w]
+        if left_right_only:
+            if mse(left, right) <= MSE_THRESHOLD:
+                return True
+        else:
+            if mse(left, center) <= MSE_THRESHOLD and mse(right, center) <= MSE_THRESHOLD:
+                return True
+    return False
 
 
 def is_tripartite_frame(
@@ -190,41 +237,86 @@ def get_tripartite_mse(
 ) -> tuple[bool, dict[str, float]]:
     """
     프레임의 삼분할 판정 + MSE 값 반환 (--verify용).
-    반환: (is_tripartite, {"left_right": mse} 또는 {"left_center": mse, "right_center": mse}).
+    ALIGN_TOLERANCE_PX > 0이면 경계를 ±N픽셀 옮겨 보며 최적 정렬에서의 MSE 반환.
+    반환: (is_tripartite, {"left_right": mse} 또는 {"left_center", "right_center"}, 필요 시 "best_L" 포함).
     """
-    if use_gpu and CUPY_AVAILABLE:
-        h, w = frame.shape[:2]
-        y0 = int(h * Y_CROP_RATIO_START)
-        y1 = int(h * Y_CROP_RATIO_END)
-        g = cp.asarray(frame[y0:y1, :])
-        third = g.shape[1] // 3
-        left = g[:, :third].astype(cp.float64)
-        center = g[:, third : 2 * third].astype(cp.float64)
-        right = g[:, 2 * third :].astype(cp.float64)
-        min_w = min(left.shape[1], center.shape[1], right.shape[1])
-        left, center, right = left[:, :min_w], center[:, :min_w], right[:, :min_w]
-        if left_right_only:
-            mse_lr = float(cp.mean((left - right) ** 2).item())
-            ok = mse_lr <= MSE_THRESHOLD
-            return (ok, {"left_right": mse_lr})
-        mse_lc = float(cp.mean((left - center) ** 2).item())
-        mse_rc = float(cp.mean((right - center) ** 2).item())
-        ok = mse_lc <= MSE_THRESHOLD and mse_rc <= MSE_THRESHOLD
-        return (ok, {"left_center": mse_lc, "right_center": mse_rc})
-    # CPU
     cropped = crop_middle_y(frame)
-    left, center, right = split_third(cropped)
-    min_w = min(left.shape[1], center.shape[1], right.shape[1])
-    left = left[:, :min_w]
-    center = center[:, :min_w]
-    right = right[:, :min_w]
+    w = cropped.shape[1]
+    base = w // 3
+    tol = ALIGN_TOLERANCE_PX
+    L_vals = (
+        [base]
+        if tol <= 0
+        else list(range(max(1, base - tol), min(w // 2, base + tol + 1)))
+    )
+
+    if use_gpu and CUPY_AVAILABLE:
+        g = cp.asarray(cropped)
+        best_mse_lr = float("inf")
+        best_mse_lc = best_mse_rc = float("inf")
+        best_L = base
+        for L in L_vals:
+            if w - L < 1:
+                continue
+            left = g[:, :L].astype(cp.float64)
+            right = g[:, w - L :].astype(cp.float64)
+            if left_right_only:
+                mse_lr = float(cp.mean((left - right) ** 2).item())
+                if mse_lr < best_mse_lr:
+                    best_mse_lr = mse_lr
+                    best_L = L
+            else:
+                center = g[:, L : w - L].astype(cp.float64)
+                min_c = min(left.shape[1], center.shape[1], right.shape[1])
+                if min_c < 1:
+                    continue
+                lc, cc, rc = left[:, :min_c], center[:, :min_c], right[:, :min_c]
+                mse_lc = float(cp.mean((lc - cc) ** 2).item())
+                mse_rc = float(cp.mean((rc - cc) ** 2).item())
+                if max(mse_lc, mse_rc) < max(best_mse_lc, best_mse_rc):
+                    best_mse_lc, best_mse_rc = mse_lc, mse_rc
+                    best_L = L
+        if left_right_only:
+            ok = best_mse_lr <= MSE_THRESHOLD
+            return (ok, {"left_right": best_mse_lr, "best_L": float(best_L)})
+        ok = best_mse_lc <= MSE_THRESHOLD and best_mse_rc <= MSE_THRESHOLD
+        return (
+            ok,
+            {"left_center": best_mse_lc, "right_center": best_mse_rc, "best_L": float(best_L)},
+        )
+
+    # CPU
+    best_mse_lr = float("inf")
+    best_mse_lc = best_mse_rc = float("inf")
+    best_L = base
+    for L in L_vals:
+        if w - L < 1:
+            continue
+        left, center, right = split_third_with_left_width(cropped, L)
+        min_w = min(left.shape[1], center.shape[1], right.shape[1])
+        if min_w < 1:
+            continue
+        left = left[:, :min_w]
+        center = center[:, :min_w]
+        right = right[:, :min_w]
+        if left_right_only:
+            mse_lr = mse(left, right)
+            if mse_lr < best_mse_lr:
+                best_mse_lr = mse_lr
+                best_L = L
+        else:
+            mse_lc = mse(left, center)
+            mse_rc = mse(right, center)
+            if max(mse_lc, mse_rc) < max(best_mse_lc, best_mse_rc):
+                best_mse_lc, best_mse_rc = mse_lc, mse_rc
+                best_L = L
     if left_right_only:
-        mse_lr = mse(left, right)
-        return (mse_lr <= MSE_THRESHOLD, {"left_right": mse_lr})
-    mse_lc = mse(left, center)
-    mse_rc = mse(right, center)
-    ok = mse_lc <= MSE_THRESHOLD and mse_rc <= MSE_THRESHOLD
-    return (ok, {"left_center": mse_lc, "right_center": mse_rc})
+        return (best_mse_lr <= MSE_THRESHOLD, {"left_right": best_mse_lr, "best_L": float(best_L)})
+    ok = best_mse_lc <= MSE_THRESHOLD and best_mse_rc <= MSE_THRESHOLD
+    return (
+        ok,
+        {"left_center": best_mse_lc, "right_center": best_mse_rc, "best_L": float(best_L)},
+    )
 
 
 def format_ts(sec: float) -> str:
@@ -268,7 +360,11 @@ def _export_verify_frames(
             return False
 
     crop = crop_middle_y(frame)
-    left, center, right = split_third(crop)
+    best_L = mse_dict.get("best_L")
+    if best_L is not None:
+        left, center, right = split_third_with_left_width(crop, int(round(best_L)))
+    else:
+        left, center, right = split_third(crop)
     fname = _ts_to_export_fname(t_sec)
     # 1) 크롭 영역 저장 (프로그램이 보는 영역)
     crop_path = export_dir / f"crop_{fname}.png"
@@ -284,7 +380,7 @@ def _export_verify_frames(
     combined = np.hstack([left, center, right])
     # cv2.putText does not support Unicode (CJK); use English for image labels
     verdict = "Tripartite OK" if ok else "Tripartite NG"
-    mse_val = next(iter(mse_dict.values()), 0)
+    mse_val = next((v for k, v in mse_dict.items() if k != "best_L"), 0)
     label = f"{verdict}  MSE={mse_val:.1f} (threshold {MSE_THRESHOLD})"
     cv2.putText(
         combined, label, (10, 28),
