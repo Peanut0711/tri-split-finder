@@ -43,6 +43,13 @@ python tripartite_section_check.py <input> [옵션...]
 | `--merge` | 검출된 구간만 코덱 카피로 잘라 한 파일로 이어붙여 저장. **인자 없으면** 원본과 같은 폴더에 **원본파일명_merged.mp4** 로 저장. |
 | `--merge OUTPUT` | 위와 동일하되, **OUTPUT**에 절대경로·파일명을 주면 그 위치에 저장. 예: `--merge "F:\세경\result.mp4"` |
 
+### 구간 목록 파일 (원하는 구간만 편집 후 병합)
+
+| 옵션 | 설명 |
+|------|------|
+| `--segments-out FILE` | 검출된 구간 목록을 **텍스트 파일**로 저장. 한 줄에 `시작시각 끝시각`. 나중에 줄 삭제 또는 `#` 붙여서 제외할 구간 정한 뒤 `--segments-in`으로 사용. |
+| `--segments-in FILE` | 구간 **검출 생략**, 파일에서 구간 목록만 읽음. `--merge` 와 함께 쓰면 해당 목록만 잘라서 병합. (예: 12개 중 10번만 제외하고 병합) |
+
 ### GPU
 
 | 옵션 | 설명 |
@@ -93,6 +100,11 @@ python tripartite_section_check.py "F:\세경\video.ts" --cuda --merge
 
 # 병합 결과를 지정 경로/파일명으로 저장
 python tripartite_section_check.py "F:\세경\video.ts" --cuda --merge "F:\세경\result.mp4"
+
+# 구간 목록을 txt로 저장 → 편집(제외할 구간 줄 삭제 또는 #) → 그 목록만 병합
+python tripartite_section_check.py "F:\세경\video.ts" --cuda --segments-out "F:\세경\segments.txt"
+# (segments.txt 에서 10번 구간 줄 삭제 또는 앞에 # 붙인 뒤)
+python tripartite_section_check.py "F:\세경\video.ts" --segments-in "F:\세경\segments.txt" --merge
 
 # 검증 + NG 시점만 이미지 무제한 저장
 python tripartite_section_check.py "video.ts" --cuda --verify 02:21:48.357 02:24:00.679 --verify-export "F:\export" --verify-export-only-x --verify-export-max 0

@@ -784,6 +784,42 @@ def find_segments(
     return (result, timings)
 
 
+def load_segments_from_file(file_path: Path) -> list[tuple[float, float]]:
+    """
+    구간 목록 텍스트 파일을 읽어 (start_sec, end_sec) 리스트로 반환.
+    한 줄에 하나의 구간: "START END" (공백/탭 구분). START/END는 HH:MM:SS.mmm 또는 초.
+    빈 줄, # 으로 시작하는 줄은 무시. 원하는 구간만 남기고 나머지 줄을 삭제하거나 # 처리하면 됨.
+    """
+    segments: list[tuple[float, float]] = []
+    path = Path(file_path).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"구간 목록 파일을 찾을 수 없습니다: {path}")
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            start = parse_ts_to_sec(parts[0])
+            end = parse_ts_to_sec(parts[1])
+            if end > start:
+                segments.append((start, end))
+        except ValueError:
+            continue
+    return segments
+
+
+def write_segments_to_file(segments: list[tuple[float, float]], file_path: Path) -> None:
+    """구간 목록을 텍스트 파일로 저장. 한 줄에 '시작 시각 끝 시각' (HH:MM:SS.mmm). # 으로 시작하는 줄은 주석."""
+    path = Path(file_path).resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    comment = "# 시작 시각 끝 시각 (한 줄에 한 구간. 해당 줄 삭제 또는 # 붙이면 병합에서 제외)"
+    lines = [comment] + [f"{format_ts(s)} {format_ts(e)}" for s, e in segments]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def merge_segments(
     path: Path,
     segments: list[tuple[float, float]],
@@ -918,12 +954,57 @@ def main() -> None:
         metavar="OUTPUT",
         help="검출된 구간만 코덱 카피로 잘라서 한 파일로 이어붙여 저장. 인자 없으면 원본과 같은 폴더에 원본파일명_merged.mp4 로 저장. 경로/파일명을 주면 그 위치에 저장. 예: --merge 또는 --merge F:\\세경\\result.mp4",
     )
+    parser.add_argument(
+        "--segments-out",
+        type=Path,
+        default=None,
+        metavar="FILE",
+        help="검출된 구간 목록을 텍스트 파일로 저장. 한 줄에 '시작 시각 끝 시각'. 나중에 편집 후 --segments-in으로 읽어 병합 가능",
+    )
+    parser.add_argument(
+        "--segments-in",
+        type=Path,
+        default=None,
+        metavar="FILE",
+        help="구간 검출 대신 파일에서 구간 목록 읽기. 빈 줄·# 줄 무시. 원하는 구간만 남기고 저장한 뒤 --segments-in FILE --merge 로 병합",
+    )
     args = parser.parse_args()
 
     path = args.input.resolve()
     if not path.is_file():
         print(f"[오류] 파일을 찾을 수 없습니다: {path}", file=sys.stderr)
         sys.exit(1)
+
+    use_gpu = getattr(args, "cuda", False)
+    segments_in = getattr(args, "segments_in", None)
+    segments_out = getattr(args, "segments_out", None)
+
+    # --segments-in: 파일에서 구간 목록 읽어서 출력·병합만 (검출 생략)
+    if segments_in is not None:
+        try:
+            segments = load_segments_from_file(segments_in)
+        except FileNotFoundError as e:
+            print(f"[오류] {e}", file=sys.stderr)
+            sys.exit(1)
+        if not segments:
+            print("[오류] 구간 목록 파일에 유효한 구간이 없습니다.", file=sys.stderr)
+            sys.exit(1)
+        print(f"입력: {path}")
+        print(f"구간 목록: {segments_in}  (총 {len(segments)}개)")
+        print("삼분할 구간:")
+        for i, (start, end) in enumerate(segments, 1):
+            print(f"  [{i}] {format_ts(start)} ~ {format_ts(end)}  (길이 {end - start:.1f}초)")
+        print("-" * 50)
+        if args.merge is not None:
+            output_path = (
+                Path(args.merge).resolve()
+                if args.merge is not True
+                else path.parent / (path.stem + "_merged.mp4")
+            )
+            print(f"구간 병합 중... (코덱 카피) → {output_path}", flush=True)
+            if not merge_segments(path, segments, output_path, use_gpu):
+                sys.exit(1)
+        return
 
     print(f"입력: {path}")
     meta_start = time.perf_counter()
@@ -935,7 +1016,6 @@ def main() -> None:
     meta_elapsed = time.perf_counter() - meta_start
 
     left_right_only = not args.strict
-    use_gpu = getattr(args, "cuda", False)
 
     # --verify: 지정 구간만 샘플링해 삼분할 여부·MSE 리포팅 후 종료
     if args.verify is not None:
@@ -1015,6 +1095,10 @@ def main() -> None:
         print(f"  [{i}] {format_ts(start)} ~ {format_ts(end)}  (길이 {end - start:.1f}초)")
     print("-" * 50)
     print(f"총 {len(segments)}개 구간  (전체 소요: {_format_elapsed(run_elapsed)})")
+
+    if segments_out is not None:
+        write_segments_to_file(segments, segments_out)
+        print(f"구간 목록 저장: {segments_out}  (편집 후 --segments-in으로 읽어 병합 가능)", flush=True)
 
     if args.merge is not None:
         output_path = (
