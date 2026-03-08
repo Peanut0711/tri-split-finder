@@ -820,6 +820,19 @@ def write_segments_to_file(segments: list[tuple[float, float]], file_path: Path)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _merge_output_path_for_input(input_path: Path) -> Path:
+    """기본 병합 파일명(원본_merged.mp4). 이미 존재하면 _merged(1).mp4, _merged(2).mp4 ... 중 존재하지 않는 이름 반환."""
+    base = input_path.parent / (input_path.stem + "_merged.mp4")
+    if not base.exists():
+        return base
+    n = 1
+    while True:
+        candidate = input_path.parent / (input_path.stem + f"_merged({n}).mp4")
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
 def merge_segments(
     path: Path,
     segments: list[tuple[float, float]],
@@ -999,7 +1012,7 @@ def main() -> None:
             output_path = (
                 Path(args.merge).resolve()
                 if args.merge is not True
-                else path.parent / (path.stem + "_merged.mp4")
+                else _merge_output_path_for_input(path)
             )
             print(f"구간 병합 중... (코덱 카피) → {output_path}", flush=True)
             if not merge_segments(path, segments, output_path, use_gpu):
@@ -1104,7 +1117,7 @@ def main() -> None:
         output_path = (
             Path(args.merge).resolve()
             if args.merge is not True
-            else path.parent / (path.stem + "_merged.mp4")
+            else _merge_output_path_for_input(path)
         )
         print(f"구간 병합 중... (코덱 카피) → {output_path}", flush=True)
         if not merge_segments(path, segments, output_path, use_gpu):
