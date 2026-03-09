@@ -996,6 +996,48 @@ def _seg_output_path_for_input(input_path: Path) -> Path:
         n += 1
 
 
+def _merge_segment_worker(args: tuple) -> tuple:
+    """
+    병렬용: 한 구간을 cut → 키프레임 탐색 → 트림해 segment_xxxx.ts 생성.
+    args = (path_str, start, end, index_0based, tmpdir_str, use_gpu, leading_buffer_sec)
+    반환: (index_0based, success, elapsed_sec, first_kf, duration_cut, buffer_sec)
+    """
+    path_str, start, end, idx, tmpdir_str, use_gpu, leading_sec = args
+    t0 = time.perf_counter()
+    tmpdir = Path(tmpdir_str)
+    seg_path = tmpdir / f"segment_{idx + 1:04d}.ts"
+    temp_seg = tmpdir / f"segment_{idx + 1:04d}_temp.ts"
+    start_cut = max(0.0, start - leading_sec)
+    duration_cut = end - start_cut
+    cmd_cut = ["ffmpeg", "-y"]
+    if use_gpu:
+        cmd_cut.extend(["-hwaccel", "cuda"])
+    cmd_cut.extend([
+        "-ss", str(start_cut), "-i", path_str,
+        "-t", str(duration_cut), "-c", "copy",
+        "-avoid_negative_ts", "make_zero", str(temp_seg),
+    ])
+    ret = subprocess.run(cmd_cut, capture_output=True, timeout=3600)
+    if ret.returncode != 0 or not temp_seg.is_file():
+        return (idx, False, time.perf_counter() - t0, None, None, None)
+    keyframes = _get_keyframe_times_from_file(temp_seg)
+    first_kf = keyframes[0] if keyframes else 0.0
+    trim_dur = duration_cut - first_kf
+    if trim_dur > 0.5:
+        cmd_trim = [
+            "ffmpeg", "-y", "-ss", str(first_kf), "-i", str(temp_seg),
+            "-t", str(trim_dur), "-c", "copy", "-avoid_negative_ts", "make_zero", str(seg_path),
+        ]
+        ret2 = subprocess.run(cmd_trim, capture_output=True, timeout=300)
+        temp_seg.unlink(missing_ok=True)
+        if ret2.returncode != 0 or not seg_path.is_file():
+            return (idx, False, time.perf_counter() - t0, None, None, None)
+    else:
+        temp_seg.rename(seg_path)
+    elapsed = time.perf_counter() - t0
+    return (idx, True, elapsed, first_kf, duration_cut, start - start_cut)
+
+
 def _merge_output_path_for_input(input_path: Path) -> Path:
     """기본 병합 파일명(원본_merged.mp4). 이미 존재하면 _merged(1).mp4, _merged(2).mp4 ... 중 존재하지 않는 이름 반환."""
     base = input_path.parent / (input_path.stem + "_merged.mp4")
@@ -1034,14 +1076,29 @@ def merge_segments(
     try:
         list_path = tmpdir / "list.txt"
         for i, (start, end) in enumerate(segments):
-            duration_sec = end - start
-            if duration_sec <= 0:
+            if (end - start) <= 0:
                 print(f"[오류] 구간 [{i + 1}] 길이 <= 0: {format_ts(start)} ~ {format_ts(end)}", file=sys.stderr)
                 return False
-            seg_path = tmpdir / f"segment_{i + 1:04d}.ts"
-            temp_seg = tmpdir / f"segment_{i + 1:04d}_temp.ts"
-            seg_start = time.perf_counter()
-            # 모든 구간: 시작 3초 앞까지 포함해 자른 뒤, 첫 키프레임까지 버리고 키프레임~끝만 사용
+        n_seg = len(segments)
+        merge_workers = 2
+        if n_seg >= 2:
+            worker_args = [
+                (path_str, start, end, i, str(tmpdir), use_gpu, LEADING_BUFFER_SEC)
+                for i, (start, end) in enumerate(segments)
+            ]
+            with ProcessPoolExecutor(max_workers=merge_workers) as executor:
+                results = list(executor.map(_merge_segment_worker, worker_args, chunksize=1))
+            for idx, ok, elapsed, first_kf, duration_cut, buffer_sec in results:
+                if not ok:
+                    print(f"[오류] 구간 [{idx + 1}] 추출 또는 트림 실패", file=sys.stderr)
+                    return False
+                print(f"  구간 [{idx + 1}/{n_seg}]  추출 완료 (앞 {buffer_sec:.1f}초 포함, 길이 {duration_cut:.1f}초)  소요 {elapsed:.1f}초", flush=True)
+                if first_kf is not None and first_kf > 0.01:
+                    print(f"  구간 [{idx + 1}] 앞부분 트림: 첫 키프레임({first_kf:.2f}초)부터 사용 (앞 {first_kf:.1f}초 제거)", flush=True)
+        else:
+            (start, end) = segments[0]
+            seg_path = tmpdir / "segment_0001.ts"
+            temp_seg = tmpdir / "segment_0001_temp.ts"
             start_cut = max(0.0, start - LEADING_BUFFER_SEC)
             duration_cut = end - start_cut
             cmd_cut = ["ffmpeg", "-y"]
@@ -1054,9 +1111,9 @@ def merge_segments(
             ])
             ret = subprocess.run(cmd_cut, capture_output=True, timeout=3600)
             if ret.returncode != 0 or not temp_seg.is_file():
-                print(f"[오류] 구간 [{i + 1}] 추출 실패: {format_ts(start_cut)} ~ {format_ts(end)}", file=sys.stderr)
+                print(f"[오류] 구간 [1] 추출 실패: {format_ts(start_cut)} ~ {format_ts(end)}", file=sys.stderr)
                 return False
-            print(f"  구간 [{i + 1}/{len(segments)}]  추출 완료 (앞 {start - start_cut:.1f}초 포함, 길이 {duration_cut:.1f}초)  소요 {time.perf_counter() - seg_start:.1f}초", flush=True)
+            print(f"  구간 [1/1]  추출 완료 (앞 {start - start_cut:.1f}초 포함, 길이 {duration_cut:.1f}초)", flush=True)
             keyframes = _get_keyframe_times_from_file(temp_seg)
             first_kf = keyframes[0] if keyframes else 0.0
             trim_dur = duration_cut - first_kf
@@ -1068,9 +1125,9 @@ def merge_segments(
                 ret2 = subprocess.run(cmd_trim, capture_output=True, timeout=300)
                 temp_seg.unlink(missing_ok=True)
                 if ret2.returncode != 0 or not seg_path.is_file():
-                    print(f"[오류] 구간 [{i + 1}] 키프레임 트림 실패", file=sys.stderr)
+                    print(f"[오류] 구간 [1] 키프레임 트림 실패", file=sys.stderr)
                     return False
-                print(f"  구간 [{i + 1}] 앞부분 트림: 첫 키프레임({first_kf:.2f}초)부터 사용 (앞 {first_kf:.1f}초 제거)", flush=True)
+                print(f"  구간 [1] 앞부분 트림: 첫 키프레임({first_kf:.2f}초)부터 사용 (앞 {first_kf:.1f}초 제거)", flush=True)
             else:
                 temp_seg.rename(seg_path)
         with open(list_path, "w", encoding="utf-8") as f:

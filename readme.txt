@@ -12,3 +12,7 @@ python tripartite_section_check.py "F:\세경\video.ts" --cuda --segments-out
 
 # 2) video_seg.txt 편집 후, 인자 없이 같은 폴더의 video_seg.txt 로 병합
 python tripartite_section_check.py "F:\세경\video.ts" --segments-in --merge
+
+python tripartite_section_check.py "\\192.168.8.113\ffmpeg\m0m099_20260305_190116.ts" --cuda --workers 16 --coarse-scale 640 --segments-out   
+
+python tripartite_section_check.py "\\192.168.8.113\ffmpeg\m0m099_20260305_190116.ts" --cuda --workers 16 --coarse-scale 640 --segments-in --merge
