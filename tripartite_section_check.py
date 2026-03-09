@@ -138,31 +138,34 @@ def _get_keyframe_times_from_file(path: Path, timeout: int = 120) -> list[float]
 
 
 def extract_frame(
-    path: Path, time_sec: float, width: int, height: int, use_gpu: bool = False
+    path: Path,
+    time_sec: float,
+    width: int,
+    height: int,
+    use_gpu: bool = False,
+    scale_width: int | None = None,
 ) -> np.ndarray | None:
-    """지정 시점의 1프레임을 BGR numpy 배열로 반환. use_gpu=True 시 ffmpeg CUDA 디코딩. 실패 시 None."""
+    """지정 시점의 1프레임을 BGR numpy 배열로 반환. use_gpu=True 시 ffmpeg CUDA 디코딩. 실패 시 None.
+    scale_width가 지정되면 해당 폭으로 리사이즈 후 반환(코스 스캔 저해상도용). 비율 유지해 높이 계산."""
+    out_w = scale_width if scale_width is not None else width
+    out_h = round(height * out_w / width) if scale_width is not None else height
+    base = ["-ss", str(time_sec), "-i", str(path)]
+    scale_filters = ["-vf", f"scale={out_w}:-1"] if scale_width is not None else []
+    tail = ["-vframes", "1", "-f", "rawvideo", "-pix_fmt", "bgr24", "-an", "-sn", "pipe:1"]
+
     cmd = ["ffmpeg", "-y"]
     if use_gpu:
         cmd.extend(["-hwaccel", "cuda"])
-    cmd.extend([
-        "-ss", str(time_sec), "-i", str(path),
-        "-vframes", "1", "-f", "rawvideo", "-pix_fmt", "bgr24",
-        "-an", "-sn", "pipe:1",
-    ])
+    cmd.extend(base + scale_filters + tail)
     try:
         out = subprocess.run(cmd, capture_output=True, timeout=15)
         if out.returncode != 0 or not out.stdout:
             if use_gpu:
-                # CUDA 실패 시 CPU로 재시도 (드라이버/코덱 미지원 등)
-                cmd_cpu = [
-                    "ffmpeg", "-y", "-ss", str(time_sec), "-i", str(path),
-                    "-vframes", "1", "-f", "rawvideo", "-pix_fmt", "bgr24",
-                    "-an", "-sn", "pipe:1",
-                ]
+                cmd_cpu = ["ffmpeg", "-y"] + base + scale_filters + tail
                 out = subprocess.run(cmd_cpu, capture_output=True, timeout=15)
             if out.returncode != 0 or not out.stdout:
                 return None
-        frame = np.frombuffer(out.stdout, dtype=np.uint8).reshape((height, width, 3))
+        frame = np.frombuffer(out.stdout, dtype=np.uint8).reshape((out_h, out_w, 3))
         return frame
     except (subprocess.TimeoutExpired, ValueError, FileNotFoundError):
         return None
@@ -577,10 +580,11 @@ def _print_progress(
 
 
 def _coarse_worker(args: tuple) -> tuple[float, bool]:
-    """멀티프로세싱용: (path_str, t, width, height, left_right_only, use_gpu) → (t, is_tripartite)."""
-    path_str, t, width, height, left_right_only, use_gpu = args
+    """멀티프로세싱용: (path_str, t, width, height, left_right_only, use_gpu, scale_width?) → (t, is_tripartite).
+    scale_width가 None이 아니면 코스 스캔만 저해상도로 추출."""
+    path_str, t, width, height, left_right_only, use_gpu, scale_width = args
     path = Path(path_str)
-    frame = extract_frame(path, t, width, height, use_gpu)
+    frame = extract_frame(path, t, width, height, use_gpu, scale_width=scale_width)
     if frame is None:
         return (t, False)
     return (t, is_tripartite_frame(frame, left_right_only, use_gpu))
@@ -671,6 +675,10 @@ def _boundary_worker(args: tuple) -> tuple[float, float] | None:
     return None
 
 
+# 코스 스캔 저해상도: 허용 폭 (640, 960, 1280). 높이는 원본 비율로 계산.
+COARSE_SCALE_WIDTHS = (640, 960, 1280)
+
+
 def find_segments(
     path: Path,
     duration: float,
@@ -681,13 +689,16 @@ def find_segments(
     left_right_only: bool = LEFT_RIGHT_ONLY_DEFAULT,
     n_workers: int = 0,
     use_gpu: bool = False,
+    coarse_scale_width: int | None = None,
 ) -> tuple[list[tuple[float, float]], dict[str, float]]:
     """
     삼분할 구간 탐색 (장편 영상 최적화).
+    coarse_scale_width가 640/960/1280이면 코스 스캔만 해당 폭으로 저해상도 추출(속도 실험용). 경계 정밀화는 원본 해상도.
     반환: (최종 구간 목록, 단계별 소요 시간 dict). 파이프라인 분석·효율화용.
     """
     timings: dict[str, float] = {}
     path_str = str(path.resolve())
+    scale_w = coarse_scale_width if coarse_scale_width in COARSE_SCALE_WIDTHS else None
 
     # 1) 시점 목록 생성
     t0 = time.perf_counter()
@@ -699,7 +710,7 @@ def find_segments(
     if duration > 0 and (not ts or ts[-1] < duration - 0.5):
         ts.append(max(0.0, duration - 0.1))
     total_points = len(ts)
-    worker_args = [(path_str, t, width, height, left_right_only, use_gpu) for t in ts]
+    worker_args = [(path_str, t, width, height, left_right_only, use_gpu, scale_w) for t in ts]
     timings["시점 목록"] = time.perf_counter() - t0
 
     coarse_results: list[tuple[float, bool]] = []
@@ -707,8 +718,8 @@ def find_segments(
 
     if n_workers <= 1:
         # 순차 처리
-        for i, (_path_s, t, w, h, lr, ug) in enumerate(worker_args):
-            frame = extract_frame(path, t, w, h, ug)
+        for i, (_path_s, t, w, h, lr, ug, sw) in enumerate(worker_args):
+            frame = extract_frame(path, t, w, h, ug, scale_width=sw)
             if frame is None:
                 coarse_results.append((t, False))
             else:
@@ -875,6 +886,19 @@ def write_segments_to_file(segments: list[tuple[float, float]], file_path: Path)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _seg_output_path_for_input(input_path: Path) -> Path:
+    """기본 구간 목록 파일명(원본_seg.txt). 이미 존재하면 _seg(1).txt, _seg(2).txt ... 중 존재하지 않는 이름 반환."""
+    base = input_path.parent / (input_path.stem + "_seg.txt")
+    if not base.exists():
+        return base
+    n = 1
+    while True:
+        candidate = input_path.parent / (input_path.stem + f"_seg({n}).txt")
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
 def _merge_output_path_for_input(input_path: Path) -> Path:
     """기본 병합 파일명(원본_merged.mp4). 이미 존재하면 _merged(1).mp4, _merged(2).mp4 ... 중 존재하지 않는 이름 반환."""
     base = input_path.parent / (input_path.stem + "_merged.mp4")
@@ -997,6 +1021,14 @@ def main() -> None:
         default=DEFAULT_WORKERS,
         metavar="N",
         help=f"코스 스캔 병렬 프로세스 수 (CPU 멀티코어). 기본 %(default)s. 1이면 순차 처리",
+    )
+    parser.add_argument(
+        "--coarse-scale",
+        type=int,
+        default=None,
+        metavar="W",
+        choices=COARSE_SCALE_WIDTHS,
+        help="코스 스캔만 저해상도로 수행 (폭 640/960/1280). 미지정 시 원본 해상도. 경계 정밀화는 항상 원본.",
     )
     parser.add_argument(
         "--cuda",
@@ -1145,7 +1177,13 @@ def main() -> None:
     print(f"비교 영역: 높이 {Y_CROP_RATIO_START*100:.0f}% ~ {Y_CROP_RATIO_END*100:.0f}% (상단 팝업 제외)")
     print(f"모드: {'좌·우만 비교 (중앙 무시)' if left_right_only else '좌=중앙=우 모두 비교 (strict)'}")
     gpu_desc = "GPU(CUDA 디코딩" + (", CuPy 판정" if CUPY_AVAILABLE else "") + ")" if use_gpu else "CPU"
-    print(f"코스 스캔: 간격 {coarse}s, 병렬 프로세스 {workers}개, 자원 {gpu_desc}")
+    coarse_scale = getattr(args, "coarse_scale", None)
+    coarse_scale = coarse_scale if coarse_scale in COARSE_SCALE_WIDTHS else None
+    coarse_res_str = ""
+    if coarse_scale is not None:
+        coarse_h = round(height * coarse_scale / width)
+        coarse_res_str = f", 코스 해상도 {coarse_scale}×{coarse_h} (저해상도)"
+    print(f"코스 스캔: 간격 {coarse}s, 병렬 프로세스 {workers}개, 자원 {gpu_desc}{coarse_res_str}")
     print("-" * 50)
 
     segments, phase_timings = find_segments(
@@ -1155,6 +1193,7 @@ def main() -> None:
         left_right_only=left_right_only,
         n_workers=workers,
         use_gpu=use_gpu,
+        coarse_scale_width=coarse_scale,
     )
 
     run_elapsed = time.perf_counter() - run_start
@@ -1197,7 +1236,7 @@ def main() -> None:
 
     if segments_out is not None:
         out_path = (
-            path.parent / (path.stem + "_seg.txt")
+            _seg_output_path_for_input(path)
             if segments_out is True
             else Path(segments_out).resolve()
         )
