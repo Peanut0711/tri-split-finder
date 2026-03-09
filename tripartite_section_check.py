@@ -867,11 +867,11 @@ def load_segments_from_file(file_path: Path) -> list[tuple[float, float]]:
 
 
 def write_segments_to_file(segments: list[tuple[float, float]], file_path: Path) -> None:
-    """구간 목록을 텍스트 파일로 저장. 한 줄에 '시작 시각 끝 시각' (HH:MM:SS.mmm). # 으로 시작하는 줄은 주석."""
+    """구간 목록을 텍스트 파일로 저장. 한 줄에 '시작 시각 끝 시각 # 길이(초)'. # 으로 시작하는 줄은 주석."""
     path = Path(file_path).resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     comment = "# 시작 시각 끝 시각 (한 줄에 한 구간. 해당 줄 삭제 또는 # 붙이면 병합에서 제외)"
-    lines = [comment] + [f"{format_ts(s)} {format_ts(e)}" for s, e in segments]
+    lines = [comment] + [f"{format_ts(s)} {format_ts(e)} # {e - s:.1f}초" for s, e in segments]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -945,7 +945,7 @@ def merge_segments(
                 if ret2.returncode != 0 or not seg_path.is_file():
                     print(f"[오류] 구간 [{i + 1}] 키프레임 트림 실패", file=sys.stderr)
                     return False
-                print(f"  구간 [{i + 1}] 앞대가리 자름: 첫 키프레임({first_kf:.2f}초)까지 버림 (앞 {first_kf:.1f}초 제거)", flush=True)
+                print(f"  구간 [{i + 1}] 앞부분 트림: 첫 키프레임({first_kf:.2f}초)부터 사용 (앞 {first_kf:.1f}초 제거)", flush=True)
             else:
                 temp_seg.rename(seg_path)
         with open(list_path, "w", encoding="utf-8") as f:
