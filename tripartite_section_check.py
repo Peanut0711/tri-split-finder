@@ -43,7 +43,7 @@ except ImportError:
 # --- 설정 (필요 시 조정) ---
 # 탐색: 코스 스캔 → 경계 구간만 이진 탐색 (3~6시간 영상에 효율적)
 COARSE_INTERVAL = 30.0  # 코스 스캔 간격(초). 30초면 6시간에 약 720회 샘플
-BOUNDARY_TOLERANCE = 0.5  # 경계 이진 탐색 정밀도(초). 지시사항: 0.5초 이내
+BOUNDARY_TOLERANCE = 1.875  # 경계 이진 탐색 정밀도(초). 기본 1.875초(속도·정확도 균형). CLI --boundary-tolerance로 변경 가능
 Y_CROP_RATIO_START = 0.35  # 높이 상 35% 지점부터 샘플 (상단 팝업 제외)
 Y_CROP_RATIO_END = 0.65  # 높이 상 65% 지점까지 샘플 (중앙부만 사용)
 MSE_THRESHOLD = 500.0  # 이 값 이하면 좌=우 동일으로 간주 (튜닝 가능)
@@ -657,14 +657,16 @@ def _binary_search_first_tripartite(
     cache_dir: Path | None = None,
     cached_times: list[float] | None = None,
     cache_usable: bool = False,
+    tolerance_sec: float | None = None,
 ) -> float:
     """[t_low, t_high] 구간에서 삼분할이 처음 나오는 시점을 이진 탐색. (t_high에서 True인 전제)"""
+    tol = tolerance_sec if tolerance_sec is not None else BOUNDARY_TOLERANCE
     if _check_tripartite_at(
         path, t_low, width, height, left_right_only, use_gpu,
         cache_dir=cache_dir, cached_times=cached_times, cache_usable=cache_usable,
     ):
         return t_low
-    while t_high - t_low > BOUNDARY_TOLERANCE:
+    while t_high - t_low > tol:
         mid = (t_low + t_high) * 0.5
         if _check_tripartite_at(
             path, mid, width, height, left_right_only, use_gpu,
@@ -687,14 +689,16 @@ def _binary_search_last_tripartite(
     cache_dir: Path | None = None,
     cached_times: list[float] | None = None,
     cache_usable: bool = False,
+    tolerance_sec: float | None = None,
 ) -> float:
     """[t_low, t_high] 구간에서 삼분할이 마지막으로 나오는 시점을 이진 탐색. (t_low에서 True인 전제)"""
+    tol = tolerance_sec if tolerance_sec is not None else BOUNDARY_TOLERANCE
     if _check_tripartite_at(
         path, t_high, width, height, left_right_only, use_gpu,
         cache_dir=cache_dir, cached_times=cached_times, cache_usable=cache_usable,
     ):
         return t_high
-    while t_high - t_low > BOUNDARY_TOLERANCE:
+    while t_high - t_low > tol:
         mid = (t_low + t_high) * 0.5
         if _check_tripartite_at(
             path, mid, width, height, left_right_only, use_gpu,
@@ -709,21 +713,24 @@ def _binary_search_last_tripartite(
 def _boundary_worker(args: tuple) -> tuple[float, float] | None:
     """
     멀티프로세싱용: 한 후보 구간의 시작·끝을 이진 탐색으로 정밀화.
-    인자 끝에 cache_dir(str|None), cached_times(list), cache_usable(bool) 추가 가능.
+    인자 끝에 cache_dir, cached_times, cache_usable, boundary_tolerance_sec 추가 가능.
     """
     n = len(args)
     path_str, t_prev, t_start_cand, t_end_cand, t_next, duration, width, height, left_right_only, use_gpu = args[:10]
     cache_dir = Path(args[10]) if n > 10 and args[10] else None
     cached_times = list(args[11]) if n > 11 and args[11] else None
     cache_usable = bool(args[12]) if n > 12 else False
+    tolerance_sec = float(args[13]) if n > 13 and args[13] is not None else None
     path = Path(path_str)
     t_start = _binary_search_first_tripartite(
         path, t_prev, t_start_cand, width, height, left_right_only, use_gpu,
         cache_dir=cache_dir, cached_times=cached_times, cache_usable=cache_usable,
+        tolerance_sec=tolerance_sec,
     )
     t_end = _binary_search_last_tripartite(
         path, t_end_cand, min(t_next, duration), width, height, left_right_only, use_gpu,
         cache_dir=cache_dir, cached_times=cached_times, cache_usable=cache_usable,
+        tolerance_sec=tolerance_sec,
     )
     if t_end <= duration and (t_end - t_start) >= 0:
         return (t_start, t_end)
@@ -746,11 +753,13 @@ def find_segments(
     use_gpu: bool = False,
     coarse_scale_width: int | None = None,
     use_coarse_cache: bool = False,
+    boundary_tolerance_sec: float | None = None,
 ) -> tuple[list[tuple[float, float]], dict[str, float]]:
     """
     삼분할 구간 탐색 (장편 영상 최적화).
     coarse_scale_width가 640/960/1280이면 코스 스캔만 해당 폭으로 저해상도 추출(속도 실험용). 경계 정밀화는 원본 해상도.
     use_coarse_cache=True면 코스 스캔 시 각 프레임을 임시 폴더에 저장하고, 경계 정밀화에서 원본 해상도일 때만 재사용 후 삭제.
+    boundary_tolerance_sec: 경계 이진 탐색 정밀도(초). None이면 BOUNDARY_TOLERANCE 사용. 크게 주면 경계 단계가 빨라지나 정확도 완화.
     반환: (최종 구간 목록, 단계별 소요 시간 dict). 파이프라인 분석·효율화용.
     """
     timings: dict[str, float] = {}
@@ -828,6 +837,7 @@ def find_segments(
                     continue
             cached_times.sort()
         cache_usable_in_boundary = (cache_dir is not None and scale_w is None and len(cached_times) > 0)
+        boundary_tol = boundary_tolerance_sec if boundary_tolerance_sec is not None else BOUNDARY_TOLERANCE
 
         # 2) 후보 구간 수집
         cand_start = time.perf_counter()
@@ -861,6 +871,7 @@ def find_segments(
                     cache_dir_str,
                     cached_times,
                     cache_usable_in_boundary,
+                    boundary_tol,
                 )
             )
             i = j
@@ -871,14 +882,16 @@ def find_segments(
         segments = []
         if n_workers <= 1 or len(candidates) == 0:
             for c in candidates:
-                (_path_s, t_prev, t_start_cand, t_end_cand, t_next, _dur, w, h, lr, ug, _cd, _ct, cache_ok) = c
+                (_path_s, t_prev, t_start_cand, t_end_cand, t_next, _dur, w, h, lr, ug, _cd, _ct, cache_ok, tol) = c
                 t_start = _binary_search_first_tripartite(
                     path, t_prev, t_start_cand, w, h, lr, ug,
                     cache_dir=cache_dir, cached_times=cached_times if cache_ok else None, cache_usable=cache_ok,
+                    tolerance_sec=tol,
                 )
                 t_end = _binary_search_last_tripartite(
                     path, t_end_cand, min(t_next, duration), w, h, lr, ug,
                     cache_dir=cache_dir, cached_times=cached_times if cache_ok else None, cache_usable=cache_ok,
+                    tolerance_sec=tol,
                 )
                 if t_end <= duration and (t_end - t_start) >= 0:
                     segments.append((t_start, t_end))
@@ -1118,6 +1131,13 @@ def main() -> None:
         help="코스 스캔 시 각 시점 프레임을 임시 폴더에 캐시. 경계 정밀화에서 원본 해상도일 때만 재사용 후 작업 끝에 삭제. --coarse-scale과 함께 사용 가능(캐시는 저장만, 경계에서는 원본 해상도 사용).",
     )
     parser.add_argument(
+        "--boundary-tolerance",
+        type=float,
+        default=None,
+        metavar="SEC",
+        help="경계 이진 탐색 정밀도(초). 미지정 시 기본값(1.875). 크게 주면 경계 단계가 빨라지나 정확도 완화. 예: 0.5(더 정밀), 1.0",
+    )
+    parser.add_argument(
         "--cuda",
         action="store_true",
         help="GPU 사용: ffmpeg CUDA 디코딩, CuPy 있으면 판정 연산도 GPU (NVIDIA 드라이버 필요)",
@@ -1210,9 +1230,13 @@ def main() -> None:
         print(f"입력: {path}")
         print(f"구간 목록: {seg_file}  (총 {len(segments)}개)")
         print("삼분할 구간:")
+        total_length_sec = 0.0
         for i, (start, end) in enumerate(segments, 1):
-            print(f"  [{i}] {format_ts(start)} ~ {format_ts(end)}  (길이 {end - start:.1f}초)")
+            seg_len = end - start
+            total_length_sec += seg_len
+            print(f"  [{i}] {format_ts(start)} ~ {format_ts(end)}  (길이 {seg_len:.1f}초)")
         print("-" * 50)
+        print(f"길이 총합: {total_length_sec:.1f}초  ({_format_elapsed(total_length_sec)})")
         if args.merge is not None:
             output_path = (
                 Path(args.merge).resolve()
@@ -1283,6 +1307,7 @@ def main() -> None:
         use_gpu=use_gpu,
         coarse_scale_width=coarse_scale,
         use_coarse_cache=use_coarse_cache,
+        boundary_tolerance_sec=args.boundary_tolerance,
     )
 
     run_elapsed = time.perf_counter() - run_start
@@ -1318,10 +1343,14 @@ def main() -> None:
         return
 
     print("삼분할 구간:")
+    total_length_sec = 0.0
     for i, (start, end) in enumerate(segments, 1):
-        print(f"  [{i}] {format_ts(start)} ~ {format_ts(end)}  (길이 {end - start:.1f}초)")
+        seg_len = end - start
+        total_length_sec += seg_len
+        print(f"  [{i}] {format_ts(start)} ~ {format_ts(end)}  (길이 {seg_len:.1f}초)")
     print("-" * 50)
     print(f"총 {len(segments)}개 구간  (전체 소요: {_format_elapsed(run_elapsed)})")
+    print(f"길이 총합: {total_length_sec:.1f}초  ({_format_elapsed(total_length_sec)})")
 
     if segments_out is not None:
         out_path = (
