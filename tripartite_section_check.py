@@ -82,6 +82,61 @@ def get_video_info(path: Path) -> tuple[float, int, int]:
     return duration, width, height
 
 
+def _get_keyframe_times_from_file(path: Path, timeout: int = 120) -> list[float]:
+    """
+    단일 파일(보통 작은 조각)에서 키프레임 PTS(초) 목록 반환.
+    packet 방식 → 0개면 frame 방식 폴백. 로컬 작은 파일용.
+    """
+    path_str = str(path)
+    # 1) packet=pts_time,flags
+    cmd_p = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "packet=pts_time,flags", "-of", "csv=p=0", path_str,
+    ]
+    try:
+        out = subprocess.run(cmd_p, capture_output=True, text=True, check=True, timeout=timeout)
+        times = []
+        for line in out.stdout.strip().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(",", 1)
+            if len(parts) < 2 or "K" not in parts[1]:
+                continue
+            try:
+                times.append(float(parts[0]))
+            except ValueError:
+                continue
+        if times:
+            return sorted(times)
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    # 2) frame=key_frame,pkt_pts_time
+    cmd_f = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "frame=key_frame,pkt_pts_time", "-of", "csv=p=0", path_str,
+    ]
+    try:
+        out = subprocess.run(cmd_f, capture_output=True, text=True, check=True, timeout=timeout)
+        times = []
+        for line in out.stdout.strip().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(",", 1)
+            if len(parts) < 2:
+                continue
+            if parts[0] != "1":
+                continue
+            try:
+                times.append(float(parts[1]))
+            except ValueError:
+                continue
+        return sorted(times)
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+
+
 def extract_frame(
     path: Path, time_sec: float, width: int, height: int, use_gpu: bool = False
 ) -> np.ndarray | None:
@@ -840,38 +895,59 @@ def merge_segments(
     use_gpu: bool = False,
 ) -> bool:
     """
-    구간 목록을 ffmpeg로 코덱 카피(-c copy)해 잘라 임시 파일로 만든 뒤,
-    concat demuxer로 한 파일로 이어붙여 output_path에 저장.
-    성공 시 True, 실패 시 False.
+    구간 목록을 ffmpeg로 코덱 카피(-c copy)해 잘라 concat demuxer로 이어붙여 output_path에 저장.
+    모든 구간: 시작 3초 앞까지 포함해 자른 뒤, 그 조각에서 첫 키프레임까지 버리고 키프레임부터 끝만 사용해 이어붙임.
     """
+    LEADING_BUFFER_SEC = 3.0  # 각 구간 자를 때 시작점 이전 3초까지 포함
     if not segments:
         return False
     output_path = output_path.resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    path_str = str(path.resolve())
     tmpdir = Path(tempfile.mkdtemp(prefix="tripartite_merge_", dir=str(output_path.parent)))
     merge_start = time.perf_counter()
     try:
         list_path = tmpdir / "list.txt"
-        path_str = str(path.resolve())
         for i, (start, end) in enumerate(segments):
-            seg_path = tmpdir / f"segment_{i + 1:04d}.ts"
-            duration = end - start
-            seg_start = time.perf_counter()
-            cmd = ["ffmpeg", "-y"]
-            if use_gpu:
-                cmd.extend(["-hwaccel", "cuda"])
-            cmd.extend([
-                "-ss", str(start), "-i", path_str,
-                "-t", str(duration), "-c", "copy",
-                "-avoid_negative_ts", "make_zero",
-                str(seg_path),
-            ])
-            ret = subprocess.run(cmd, capture_output=True, timeout=3600)
-            seg_elapsed = time.perf_counter() - seg_start
-            if ret.returncode != 0 or not seg_path.is_file():
-                print(f"[오류] 구간 [{i + 1}] 추출 실패: {format_ts(start)} ~ {format_ts(end)}", file=sys.stderr)
+            duration_sec = end - start
+            if duration_sec <= 0:
+                print(f"[오류] 구간 [{i + 1}] 길이 <= 0: {format_ts(start)} ~ {format_ts(end)}", file=sys.stderr)
                 return False
-            print(f"  구간 [{i + 1}/{len(segments)}]  {format_ts(start)} ~ {format_ts(end)}  (길이 {duration:.1f}초)  소요 {seg_elapsed:.1f}초", flush=True)
+            seg_path = tmpdir / f"segment_{i + 1:04d}.ts"
+            temp_seg = tmpdir / f"segment_{i + 1:04d}_temp.ts"
+            seg_start = time.perf_counter()
+            # 모든 구간: 시작 3초 앞까지 포함해 자른 뒤, 첫 키프레임까지 버리고 키프레임~끝만 사용
+            start_cut = max(0.0, start - LEADING_BUFFER_SEC)
+            duration_cut = end - start_cut
+            cmd_cut = ["ffmpeg", "-y"]
+            if use_gpu:
+                cmd_cut.extend(["-hwaccel", "cuda"])
+            cmd_cut.extend([
+                "-ss", str(start_cut), "-i", path_str,
+                "-t", str(duration_cut), "-c", "copy",
+                "-avoid_negative_ts", "make_zero", str(temp_seg),
+            ])
+            ret = subprocess.run(cmd_cut, capture_output=True, timeout=3600)
+            if ret.returncode != 0 or not temp_seg.is_file():
+                print(f"[오류] 구간 [{i + 1}] 추출 실패: {format_ts(start_cut)} ~ {format_ts(end)}", file=sys.stderr)
+                return False
+            print(f"  구간 [{i + 1}/{len(segments)}]  추출 완료 (앞 {start - start_cut:.1f}초 포함, 길이 {duration_cut:.1f}초)  소요 {time.perf_counter() - seg_start:.1f}초", flush=True)
+            keyframes = _get_keyframe_times_from_file(temp_seg)
+            first_kf = keyframes[0] if keyframes else 0.0
+            trim_dur = duration_cut - first_kf
+            if trim_dur > 0.5:
+                cmd_trim = [
+                    "ffmpeg", "-y", "-ss", str(first_kf), "-i", str(temp_seg),
+                    "-t", str(trim_dur), "-c", "copy", "-avoid_negative_ts", "make_zero", str(seg_path),
+                ]
+                ret2 = subprocess.run(cmd_trim, capture_output=True, timeout=300)
+                temp_seg.unlink(missing_ok=True)
+                if ret2.returncode != 0 or not seg_path.is_file():
+                    print(f"[오류] 구간 [{i + 1}] 키프레임 트림 실패", file=sys.stderr)
+                    return False
+                print(f"  구간 [{i + 1}] 앞대가리 자름: 첫 키프레임({first_kf:.2f}초)까지 버림 (앞 {first_kf:.1f}초 제거)", flush=True)
+            else:
+                temp_seg.rename(seg_path)
         with open(list_path, "w", encoding="utf-8") as f:
             for i in range(len(segments)):
                 seg_name = f"segment_{i + 1:04d}.ts"
