@@ -1077,18 +1077,26 @@ def merge_segments(
             for i in range(len(segments)):
                 seg_name = f"segment_{i + 1:04d}.ts"
                 f.write(f"file '{seg_name}'\n")
+        # concat은 항상 로컬 임시 파일에 먼저 써서 속도 확보, 이후 최종 경로로 복사
+        local_merged = tmpdir / "merged.mp4"
         concat_start = time.perf_counter()
         cmd_concat = [
             "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-            "-i", str(list_path), "-c", "copy", str(output_path),
+            "-i", str(list_path), "-c", "copy", str(local_merged),
         ]
         ret = subprocess.run(cmd_concat, capture_output=True, timeout=3600, cwd=str(tmpdir))
         concat_elapsed = time.perf_counter() - concat_start
-        if ret.returncode != 0 or not output_path.is_file():
+        if ret.returncode != 0 or not local_merged.is_file():
             print("[오류] 구간 합치기(concat) 실패", file=sys.stderr)
             return False
+        print(f"  concat 합치기(로컬)  소요 {concat_elapsed:.1f}초", flush=True)
+        # 최종 경로가 로컬 임시와 다르면 복사(네트워크 등)
+        if local_merged.resolve() != output_path.resolve():
+            copy_start = time.perf_counter()
+            shutil.copy2(str(local_merged), str(output_path))
+            copy_elapsed = time.perf_counter() - copy_start
+            print(f"  최종 파일 복사 → {output_path}  소요 {copy_elapsed:.1f}초", flush=True)
         total_elapsed = time.perf_counter() - merge_start
-        print(f"  concat 합치기  소요 {concat_elapsed:.1f}초", flush=True)
         print(f"병합 완료: {output_path}  (총 {len(segments)}개 구간, 병합 총 소요 {total_elapsed:.1f}초)", flush=True)
         return True
     finally:
