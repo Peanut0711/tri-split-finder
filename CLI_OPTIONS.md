@@ -36,6 +36,7 @@ python tripartite_section_check.py <input> [옵션...]
 | `--coarse-interval SEC` | float | 30.0 | 코스 스캔 간격(초). 작을수록 촘촘, 클수록 성김 |
 | `--workers N` | int | CPU 코어 수 | 코스 스캔에 쓸 병렬 프로세스 수. 1이면 순차 처리 |
 | `--boundary-tolerance SEC` | float | 1.875 | 경계 이진 탐색 정밀도(초). 크게 주면 경계 단계가 빨라지나 정확도 완화. 기본 1.875(속도·정확도 균형). 예: 0.5(더 정밀), 1.0 |
+| `--align-tolerance PX` | int | 0 | 경계 정렬 탐색 허용(픽셀). 0이면 고정 1/3·2/3만 사용. N이면 w/3±N 픽셀 범위에서 최적 좌/우 너비 탐색. 예: 10, 30 |
 
 ### 구간 병합 (코덱 카피)
 
@@ -123,5 +124,5 @@ python tripartite_section_check.py "video.ts" --verify 02:21:00 02:22:00 --verif
 
 - **필수 외부 도구**: `ffmpeg`, `ffprobe` (PATH에 등록)
 - **패키지**: `opencv-python`, `numpy`; GPU 시 `cupy-cuda12x` 등 (선택)
-- **정렬 허용**: 가상선이 640/1280이 아닌 647/1273처럼 약간 어긋난 경우도 인식하도록, 코드 내 `ALIGN_TOLERANCE_PX`(기본 30)로 경계를 ±N픽셀 탐색합니다. 명령줄 옵션은 없고, 필요 시 스크립트 상단 상수만 수정하면 됩니다.
+- **정렬 허용**: 가상선이 640/1280이 아닌 647/1273처럼 약간 어긋난 경우도 인식하도록 `--align-tolerance PX`로 경계를 ±N픽셀 탐색합니다. 기본값 0(고정 1/3·2/3만 사용). 예: `--align-tolerance 30`
 - **메모**: `--boundary-tolerance` 기본값은 **1.875초**. 경계 이진 탐색 정밀도를 이 값으로 두어 속도 이득을 기본으로 하고, 더 정밀히 하려면 `--boundary-tolerance 0.5` 등으로 줄이면 됩니다.

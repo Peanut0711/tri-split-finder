@@ -43,12 +43,12 @@ except ImportError:
 # --- 설정 (필요 시 조정) ---
 # 탐색: 코스 스캔 → 경계 구간만 이진 탐색 (3~6시간 영상에 효율적)
 COARSE_INTERVAL = 30.0  # 코스 스캔 간격(초). 30초면 6시간에 약 720회 샘플
-BOUNDARY_TOLERANCE = 1.875  # 경계 이진 탐색 정밀도(초). 기본 1.875초(속도·정확도 균형). CLI --boundary-tolerance로 변경 가능
+BOUNDARY_TOLERANCE = 0.9375  # 경계 이진 탐색 정밀도(초). 기본 0.9375초(속도·정확도 균형). CLI --boundary-tolerance로 변경 가능
 Y_CROP_RATIO_START = 0.35  # 높이 상 35% 지점부터 샘플 (상단 팝업 제외)
 Y_CROP_RATIO_END = 0.65  # 높이 상 65% 지점까지 샘플 (중앙부만 사용)
 MSE_THRESHOLD = 500.0  # 이 값 이하면 좌=우 동일으로 간주 (튜닝 가능)
 # 송출자가 가상선을 640/1280 대신 647/1273 등으로 그린 경우 대비: 경계를 ±N픽셀 옮겨 보며 MSE 최소인 정렬 탐색
-ALIGN_TOLERANCE_PX = 10  # 0이면 고정 1/3·2/3만 사용, 10이면 w/3±10 픽셀 범위에서 최적 좌/우 너비 탐색
+ALIGN_TOLERANCE_PX = 5  # 0이면 고정 1/3·2/3만 사용, 10이면 w/3±10 픽셀 범위에서 최적 좌/우 너비 탐색
 MIN_SEGMENT_DURATION = 20.0  # 최소 구간 길이(초), 이보다 짧으면 구간으로 인정 안 함(선택)
 MERGE_GAP_SECONDS = 10.0  # 인접 구간이 이 시간(초) 이내면 하나로 병합
 # 병합 시 임시 폴더: 사용자 Videos 아래 전용 폴더 사용(로컬/NVMe 체감용). 실행마다 그 안에 merge_xxx 생성 후 삭제.
@@ -210,17 +210,19 @@ def mse(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.mean((a.astype(np.float64) - b.astype(np.float64)) ** 2))
 
 
-def _is_tripartite_frame_gpu(frame: np.ndarray, left_right_only: bool) -> bool:
+def _is_tripartite_frame_gpu(
+    frame: np.ndarray, left_right_only: bool, align_tolerance_px: int | None = None
+) -> bool:
     """CuPy로 crop/split/MSE를 GPU에서 수행 (use_gpu 시 호출)."""
     if not CUPY_AVAILABLE:
-        return _is_tripartite_frame_cpu(frame, left_right_only)
+        return _is_tripartite_frame_cpu(frame, left_right_only, align_tolerance_px)
     h, w = frame.shape[:2]
     y0 = int(h * Y_CROP_RATIO_START)
     y1 = int(h * Y_CROP_RATIO_END)
     g = cp.asarray(frame[y0:y1, :])
     crop_w = g.shape[1]
     base = crop_w // 3
-    tol = ALIGN_TOLERANCE_PX
+    tol = align_tolerance_px if align_tolerance_px is not None else ALIGN_TOLERANCE_PX
     if tol <= 0:
         L_vals = [base]
     else:
@@ -252,12 +254,14 @@ def _is_tripartite_frame_gpu(frame: np.ndarray, left_right_only: bool) -> bool:
     return False
 
 
-def _is_tripartite_frame_cpu(frame: np.ndarray, left_right_only: bool) -> bool:
+def _is_tripartite_frame_cpu(
+    frame: np.ndarray, left_right_only: bool, align_tolerance_px: int | None = None
+) -> bool:
     """CPU(NumPy) 경로. ALIGN_TOLERANCE_PX > 0이면 경계를 ±N픽셀 옮겨 보며 최적 정렬 탐색."""
     cropped = crop_middle_y(frame)
     w = cropped.shape[1]
     base = w // 3
-    tol = ALIGN_TOLERANCE_PX
+    tol = align_tolerance_px if align_tolerance_px is not None else ALIGN_TOLERANCE_PX
     if tol <= 0:
         L_vals = [base]
     else:
@@ -282,7 +286,10 @@ def _is_tripartite_frame_cpu(frame: np.ndarray, left_right_only: bool) -> bool:
 
 
 def is_tripartite_frame(
-    frame: np.ndarray, left_right_only: bool = True, use_gpu: bool = False
+    frame: np.ndarray,
+    left_right_only: bool = True,
+    use_gpu: bool = False,
+    align_tolerance_px: int | None = None,
 ) -> bool:
     """
     프레임이 삼분할인지 판정. 높이 중앙부만 사용.
@@ -290,12 +297,15 @@ def is_tripartite_frame(
     use_gpu=True이고 CuPy 있으면 GPU에서 crop/MSE 수행.
     """
     if use_gpu and CUPY_AVAILABLE:
-        return _is_tripartite_frame_gpu(frame, left_right_only)
-    return _is_tripartite_frame_cpu(frame, left_right_only)
+        return _is_tripartite_frame_gpu(frame, left_right_only, align_tolerance_px)
+    return _is_tripartite_frame_cpu(frame, left_right_only, align_tolerance_px)
 
 
 def get_tripartite_mse(
-    frame: np.ndarray, left_right_only: bool = True, use_gpu: bool = False
+    frame: np.ndarray,
+    left_right_only: bool = True,
+    use_gpu: bool = False,
+    align_tolerance_px: int | None = None,
 ) -> tuple[bool, dict[str, float]]:
     """
     프레임의 삼분할 판정 + MSE 값 반환 (--verify용).
@@ -305,7 +315,7 @@ def get_tripartite_mse(
     cropped = crop_middle_y(frame)
     w = cropped.shape[1]
     base = w // 3
-    tol = ALIGN_TOLERANCE_PX
+    tol = align_tolerance_px if align_tolerance_px is not None else ALIGN_TOLERANCE_PX
     L_vals = (
         [base]
         if tol <= 0
@@ -501,6 +511,7 @@ def verify_segment(
     export_dir: Path | None = None,
     export_max: int = 20,
     export_only_x: bool = False,
+    align_tolerance_px: int | None = None,
 ) -> None:
     """
     지정 구간을 일정 간격으로 샘플링해 각 시점의 삼분할 여부와 MSE를 출력.
@@ -534,7 +545,9 @@ def verify_segment(
             print(f"  {format_ts(t)}  [프레임 추출 실패]", flush=True)
             t += interval_sec
             continue
-        ok, mse_dict = get_tripartite_mse(frame, left_right_only, use_gpu)
+        ok, mse_dict = get_tripartite_mse(
+            frame, left_right_only, use_gpu, align_tolerance_px=align_tolerance_px
+        )
         samples.append((t, ok, mse_dict))
         mse_str = ", ".join(f"{k}={v:.1f}" for k, v in mse_dict.items())
         verdict = "삼분할 O" if ok else "삼분할 X"
@@ -583,9 +596,10 @@ def _print_progress(
 
 
 def _coarse_worker(args: tuple) -> tuple[float, bool]:
-    """멀티프로세싱용: (path_str, t, width, height, left_right_only, use_gpu, scale_width?, cache_dir?) → (t, is_tripartite).
+    """멀티프로세싱용: (path_str, t, width, height, left_right_only, use_gpu, scale_width?, cache_dir?, align_tolerance_px?) → (t, is_tripartite).
     scale_width가 None이 아니면 코스 스캔만 저해상도. cache_dir이 있으면 해당 프레임을 .npy로 저장."""
     path_str, t, width, height, left_right_only, use_gpu, scale_width, cache_dir = args[:8]
+    align_tol_px = int(args[8]) if len(args) > 8 and args[8] is not None else None
     path = Path(path_str)
     frame = extract_frame(path, t, width, height, use_gpu, scale_width=scale_width)
     if frame is None:
@@ -596,7 +610,7 @@ def _coarse_worker(args: tuple) -> tuple[float, bool]:
             np.save(out, frame)
         except (OSError, ValueError):
             pass
-    return (t, is_tripartite_frame(frame, left_right_only, use_gpu))
+    return (t, is_tripartite_frame(frame, left_right_only, use_gpu, align_tolerance_px=align_tol_px))
 
 
 def _get_frame_for_check(
@@ -639,13 +653,16 @@ def _check_tripartite_at(
     cache_dir: Path | None = None,
     cached_times: list[float] | None = None,
     cache_usable: bool = False,
+    align_tolerance_px: int | None = None,
 ) -> bool:
     """시점 t에서 1프레임 추출(또는 캐시 로드) 후 삼분할 여부 반환."""
     if cache_usable and cache_dir is not None and cached_times is not None:
         frame = _get_frame_for_check(path, t, width, height, use_gpu, cache_dir, cached_times)
     else:
         frame = extract_frame(path, t, width, height, use_gpu)
-    return frame is not None and is_tripartite_frame(frame, left_right_only, use_gpu)
+    return frame is not None and is_tripartite_frame(
+        frame, left_right_only, use_gpu, align_tolerance_px=align_tolerance_px
+    )
 
 
 def _binary_search_first_tripartite(
@@ -660,12 +677,14 @@ def _binary_search_first_tripartite(
     cached_times: list[float] | None = None,
     cache_usable: bool = False,
     tolerance_sec: float | None = None,
+    align_tolerance_px: int | None = None,
 ) -> float:
     """[t_low, t_high] 구간에서 삼분할이 처음 나오는 시점을 이진 탐색. (t_high에서 True인 전제)"""
     tol = tolerance_sec if tolerance_sec is not None else BOUNDARY_TOLERANCE
     if _check_tripartite_at(
         path, t_low, width, height, left_right_only, use_gpu,
         cache_dir=cache_dir, cached_times=cached_times, cache_usable=cache_usable,
+        align_tolerance_px=align_tolerance_px,
     ):
         return t_low
     while t_high - t_low > tol:
@@ -673,6 +692,7 @@ def _binary_search_first_tripartite(
         if _check_tripartite_at(
             path, mid, width, height, left_right_only, use_gpu,
             cache_dir=cache_dir, cached_times=cached_times, cache_usable=cache_usable,
+            align_tolerance_px=align_tolerance_px,
         ):
             t_high = mid
         else:
@@ -692,12 +712,14 @@ def _binary_search_last_tripartite(
     cached_times: list[float] | None = None,
     cache_usable: bool = False,
     tolerance_sec: float | None = None,
+    align_tolerance_px: int | None = None,
 ) -> float:
     """[t_low, t_high] 구간에서 삼분할이 마지막으로 나오는 시점을 이진 탐색. (t_low에서 True인 전제)"""
     tol = tolerance_sec if tolerance_sec is not None else BOUNDARY_TOLERANCE
     if _check_tripartite_at(
         path, t_high, width, height, left_right_only, use_gpu,
         cache_dir=cache_dir, cached_times=cached_times, cache_usable=cache_usable,
+        align_tolerance_px=align_tolerance_px,
     ):
         return t_high
     while t_high - t_low > tol:
@@ -705,6 +727,7 @@ def _binary_search_last_tripartite(
         if _check_tripartite_at(
             path, mid, width, height, left_right_only, use_gpu,
             cache_dir=cache_dir, cached_times=cached_times, cache_usable=cache_usable,
+            align_tolerance_px=align_tolerance_px,
         ):
             t_low = mid
         else:
@@ -715,7 +738,7 @@ def _binary_search_last_tripartite(
 def _boundary_worker(args: tuple) -> tuple[float, float] | None:
     """
     멀티프로세싱용: 한 후보 구간의 시작·끝을 이진 탐색으로 정밀화.
-    인자 끝에 cache_dir, cached_times, cache_usable, boundary_tolerance_sec 추가 가능.
+    인자 끝에 cache_dir, cached_times, cache_usable, boundary_tolerance_sec, align_tolerance_px 추가 가능.
     """
     n = len(args)
     path_str, t_prev, t_start_cand, t_end_cand, t_next, duration, width, height, left_right_only, use_gpu = args[:10]
@@ -723,16 +746,17 @@ def _boundary_worker(args: tuple) -> tuple[float, float] | None:
     cached_times = list(args[11]) if n > 11 and args[11] else None
     cache_usable = bool(args[12]) if n > 12 else False
     tolerance_sec = float(args[13]) if n > 13 and args[13] is not None else None
+    align_tol_px = int(args[14]) if n > 14 and args[14] is not None else None
     path = Path(path_str)
     t_start = _binary_search_first_tripartite(
         path, t_prev, t_start_cand, width, height, left_right_only, use_gpu,
         cache_dir=cache_dir, cached_times=cached_times, cache_usable=cache_usable,
-        tolerance_sec=tolerance_sec,
+        tolerance_sec=tolerance_sec, align_tolerance_px=align_tol_px,
     )
     t_end = _binary_search_last_tripartite(
         path, t_end_cand, min(t_next, duration), width, height, left_right_only, use_gpu,
         cache_dir=cache_dir, cached_times=cached_times, cache_usable=cache_usable,
-        tolerance_sec=tolerance_sec,
+        tolerance_sec=tolerance_sec, align_tolerance_px=align_tol_px,
     )
     if t_end <= duration and (t_end - t_start) >= 0:
         return (t_start, t_end)
@@ -756,6 +780,7 @@ def find_segments(
     coarse_scale_width: int | None = None,
     use_coarse_cache: bool = False,
     boundary_tolerance_sec: float | None = None,
+    align_tolerance_px: int | None = None,
 ) -> tuple[list[tuple[float, float]], dict[str, float]]:
     """
     삼분할 구간 탐색 (장편 영상 최적화).
@@ -788,14 +813,17 @@ def find_segments(
         if duration > 0 and (not ts or ts[-1] < duration - 0.5):
             ts.append(max(0.0, duration - 0.1))
         total_points = len(ts)
-        worker_args = [(path_str, t, width, height, left_right_only, use_gpu, scale_w, cache_dir_str) for t in ts]
+        worker_args = [
+            (path_str, t, width, height, left_right_only, use_gpu, scale_w, cache_dir_str, align_tolerance_px)
+            for t in ts
+        ]
         timings["시점 목록"] = time.perf_counter() - t0
 
         coarse_results: list[tuple[float, bool]] = []
         scan_start = time.perf_counter()
 
         if n_workers <= 1:
-            for i, (_path_s, t, w, h, lr, ug, sw, _cd) in enumerate(worker_args):
+            for i, (_path_s, t, w, h, lr, ug, sw, _cd, align_tol) in enumerate(worker_args):
                 frame = extract_frame(path, t, w, h, ug, scale_width=sw)
                 if frame is None:
                     coarse_results.append((t, False))
@@ -805,7 +833,7 @@ def find_segments(
                             np.save(cache_dir / f"frame_{t:.3f}.npy", frame)
                         except (OSError, ValueError):
                             pass
-                    coarse_results.append((t, is_tripartite_frame(frame, lr, ug)))
+                    coarse_results.append((t, is_tripartite_frame(frame, lr, ug, align_tolerance_px=align_tol)))
                 if (i + 1) % 30 == 0:
                     _print_progress(ts[i], duration, scan_start, i + 1, total_points)
         else:
@@ -874,6 +902,7 @@ def find_segments(
                     cached_times,
                     cache_usable_in_boundary,
                     boundary_tol,
+                    align_tolerance_px,
                 )
             )
             i = j
@@ -884,16 +913,16 @@ def find_segments(
         segments = []
         if n_workers <= 1 or len(candidates) == 0:
             for c in candidates:
-                (_path_s, t_prev, t_start_cand, t_end_cand, t_next, _dur, w, h, lr, ug, _cd, _ct, cache_ok, tol) = c
+                (_path_s, t_prev, t_start_cand, t_end_cand, t_next, _dur, w, h, lr, ug, _cd, _ct, cache_ok, tol, align_tol) = c
                 t_start = _binary_search_first_tripartite(
                     path, t_prev, t_start_cand, w, h, lr, ug,
                     cache_dir=cache_dir, cached_times=cached_times if cache_ok else None, cache_usable=cache_ok,
-                    tolerance_sec=tol,
+                    tolerance_sec=tol, align_tolerance_px=align_tol,
                 )
                 t_end = _binary_search_last_tripartite(
                     path, t_end_cand, min(t_next, duration), w, h, lr, ug,
                     cache_dir=cache_dir, cached_times=cached_times if cache_ok else None, cache_usable=cache_ok,
-                    tolerance_sec=tol,
+                    tolerance_sec=tol, align_tolerance_px=align_tol,
                 )
                 if t_end <= duration and (t_end - t_start) >= 0:
                     segments.append((t_start, t_end))
@@ -1243,6 +1272,13 @@ def main() -> None:
         help="경계 이진 탐색 정밀도(초). 미지정 시 기본값(1.875). 크게 주면 경계 단계가 빨라지나 정확도 완화. 예: 0.5(더 정밀), 1.0",
     )
     parser.add_argument(
+        "--align-tolerance",
+        type=int,
+        default=None,
+        metavar="PX",
+        help="경계 정렬 탐색 허용(픽셀). 0이면 고정 1/3·2/3만 사용. N이면 w/3±N 픽셀 범위에서 최적 좌/우 너비 탐색. 미지정 시 기본값(0). 예: 10, 30",
+    )
+    parser.add_argument(
         "--cuda",
         action="store_true",
         help="GPU 사용: ffmpeg CUDA 디코딩, CuPy 있으면 판정 연산도 GPU (NVIDIA 드라이버 필요)",
@@ -1389,6 +1425,7 @@ def main() -> None:
             export_dir=getattr(args, "verify_export", None),
             export_max=max(0, getattr(args, "verify_export_max", 20)),
             export_only_x=getattr(args, "verify_export_only_x", False),
+            align_tolerance_px=args.align_tolerance,
         )
         return
 
@@ -1420,6 +1457,7 @@ def main() -> None:
         coarse_scale_width=coarse_scale,
         use_coarse_cache=use_coarse_cache,
         boundary_tolerance_sec=args.boundary_tolerance,
+        align_tolerance_px=args.align_tolerance,
     )
 
     run_elapsed = time.perf_counter() - run_start

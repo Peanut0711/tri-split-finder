@@ -16,3 +16,9 @@ python tripartite_section_check.py "F:\세경\video.ts" --segments-in --merge
 python tripartite_section_check.py "\\192.168.8.113\ffmpeg\m0m099_20260305_190116.ts" --cuda --workers 16 --coarse-scale 640 --segments-out   
 
 python tripartite_section_check.py "\\192.168.8.113\ffmpeg\m0m099_20260305_190116.ts" --cuda --workers 16 --coarse-scale 640 --segments-in --merge
+
+# 기본(0): 고정 1/3·2/3만 사용
+python tripartite_section_check.py input.ts
+
+# 경계를 ±30픽셀 탐색
+python tripartite_section_check.py input.ts --align-tolerance 30
