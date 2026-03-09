@@ -1000,7 +1000,7 @@ def _merge_segment_worker(args: tuple) -> tuple:
     """
     병렬용: 한 구간을 cut → 키프레임 탐색 → 트림해 segment_xxxx.ts 생성.
     args = (path_str, start, end, index_0based, tmpdir_str, use_gpu, leading_buffer_sec)
-    반환: (index_0based, success, elapsed_sec, first_kf, duration_cut, buffer_sec)
+    반환: (index_0based, success, elapsed_sec, first_kf, duration_cut, buffer_sec, cut_sec, trim_sec)
     """
     path_str, start, end, idx, tmpdir_str, use_gpu, leading_sec = args
     t0 = time.perf_counter()
@@ -1017,25 +1017,54 @@ def _merge_segment_worker(args: tuple) -> tuple:
         "-t", str(duration_cut), "-c", "copy",
         "-avoid_negative_ts", "make_zero", str(temp_seg),
     ])
+    t_cut_start = time.perf_counter()
     ret = subprocess.run(cmd_cut, capture_output=True, timeout=3600)
+    cut_sec = time.perf_counter() - t_cut_start
     if ret.returncode != 0 or not temp_seg.is_file():
-        return (idx, False, time.perf_counter() - t0, None, None, None)
+        return (idx, False, time.perf_counter() - t0, None, None, None, cut_sec, None)
     keyframes = _get_keyframe_times_from_file(temp_seg)
     first_kf = keyframes[0] if keyframes else 0.0
     trim_dur = duration_cut - first_kf
+    trim_sec = 0.0
     if trim_dur > 0.5:
         cmd_trim = [
             "ffmpeg", "-y", "-ss", str(first_kf), "-i", str(temp_seg),
             "-t", str(trim_dur), "-c", "copy", "-avoid_negative_ts", "make_zero", str(seg_path),
         ]
+        t_trim_start = time.perf_counter()
         ret2 = subprocess.run(cmd_trim, capture_output=True, timeout=300)
+        trim_sec = time.perf_counter() - t_trim_start
         temp_seg.unlink(missing_ok=True)
         if ret2.returncode != 0 or not seg_path.is_file():
-            return (idx, False, time.perf_counter() - t0, None, None, None)
+            return (idx, False, time.perf_counter() - t0, None, None, None, cut_sec, trim_sec)
     else:
         temp_seg.rename(seg_path)
     elapsed = time.perf_counter() - t0
-    return (idx, True, elapsed, first_kf, duration_cut, start - start_cut)
+    return (idx, True, elapsed, first_kf, duration_cut, start - start_cut, cut_sec, trim_sec)
+
+
+def _start_background_copy(src: str, dst: str) -> None:
+    """
+    스테이징 파일(src)을 최종 경로(dst)로 복사한 뒤 src를 삭제하는 프로세스를 백그라운드로 기동.
+    부모 프로세스는 대기하지 않고 반환한다.
+    """
+    cmd = [
+        sys.executable, "-c",
+        "import shutil,sys; from pathlib import Path;"
+        " shutil.copy2(sys.argv[1], sys.argv[2]);"
+        " Path(sys.argv[1]).unlink(missing_ok=True)",
+        src, dst,
+    ]
+    kwargs = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+    else:
+        kwargs["start_new_session"] = True
+    subprocess.Popen(cmd, **kwargs)
 
 
 def _merge_output_path_for_input(input_path: Path) -> Path:
@@ -1056,6 +1085,7 @@ def merge_segments(
     segments: list[tuple[float, float]],
     output_path: Path,
     use_gpu: bool = False,
+    merge_workers: int = 2,
 ) -> bool:
     """
     구간 목록을 ffmpeg로 코덱 카피(-c copy)해 잘라 concat demuxer로 이어붙여 output_path에 저장.
@@ -1080,19 +1110,21 @@ def merge_segments(
                 print(f"[오류] 구간 [{i + 1}] 길이 <= 0: {format_ts(start)} ~ {format_ts(end)}", file=sys.stderr)
                 return False
         n_seg = len(segments)
-        merge_workers = 2
+        n_workers = max(1, merge_workers)
         if n_seg >= 2:
             worker_args = [
                 (path_str, start, end, i, str(tmpdir), use_gpu, LEADING_BUFFER_SEC)
                 for i, (start, end) in enumerate(segments)
             ]
-            with ProcessPoolExecutor(max_workers=merge_workers) as executor:
+            with ProcessPoolExecutor(max_workers=n_workers) as executor:
                 results = list(executor.map(_merge_segment_worker, worker_args, chunksize=1))
-            for idx, ok, elapsed, first_kf, duration_cut, buffer_sec in results:
+            for idx, ok, elapsed, first_kf, duration_cut, buffer_sec, cut_sec, trim_sec in results:
                 if not ok:
                     print(f"[오류] 구간 [{idx + 1}] 추출 또는 트림 실패", file=sys.stderr)
                     return False
-                print(f"  구간 [{idx + 1}/{n_seg}]  추출 완료 (앞 {buffer_sec:.1f}초 포함, 길이 {duration_cut:.1f}초)  소요 {elapsed:.1f}초", flush=True)
+                cut_str = f" cut {cut_sec:.1f}초" if cut_sec is not None else ""
+                trim_str = f" trim {trim_sec:.1f}초" if trim_sec is not None and trim_sec > 0 else ""
+                print(f"  구간 [{idx + 1}/{n_seg}]  추출 완료 (앞 {buffer_sec:.1f}초 포함, 길이 {duration_cut:.1f}초){cut_str}{trim_str}  소요 {elapsed:.1f}초", flush=True)
                 if first_kf is not None and first_kf > 0.01:
                     print(f"  구간 [{idx + 1}] 앞부분 트림: 첫 키프레임({first_kf:.2f}초)부터 사용 (앞 {first_kf:.1f}초 제거)", flush=True)
         else:
@@ -1147,14 +1179,16 @@ def merge_segments(
             print("[오류] 구간 합치기(concat) 실패", file=sys.stderr)
             return False
         print(f"  concat 합치기(로컬)  소요 {concat_elapsed:.1f}초", flush=True)
-        # 최종 경로가 로컬 임시와 다르면 복사(네트워크 등)
+        # 최종 경로가 로컬 임시와 다르면 복사. 비동기: 로컬 스테이징 후 백그라운드에서 최종 경로로 복사.
         if local_merged.resolve() != output_path.resolve():
-            copy_start = time.perf_counter()
-            shutil.copy2(str(local_merged), str(output_path))
-            copy_elapsed = time.perf_counter() - copy_start
-            print(f"  최종 파일 복사 → {output_path}  소요 {copy_elapsed:.1f}초", flush=True)
-        total_elapsed = time.perf_counter() - merge_start
-        print(f"병합 완료: {output_path}  (총 {len(segments)}개 구간, 병합 총 소요 {total_elapsed:.1f}초)", flush=True)
+            staging_path = merge_base / f"merged_staging_{time.time_ns()}.mp4"
+            shutil.copy2(str(local_merged), str(staging_path))
+            _start_background_copy(str(staging_path), str(output_path.resolve()))
+            print(f"  최종 파일 복사 → 백그라운드 진행 중: {output_path}", flush=True)
+            print(f"병합 완료(로컬). 네트워크/최종 경로로 복사는 백그라운드에서 진행 중.  (총 {len(segments)}개 구간, 병합 소요 {time.perf_counter() - merge_start:.1f}초)", flush=True)
+        else:
+            total_elapsed = time.perf_counter() - merge_start
+            print(f"병합 완료: {output_path}  (총 {len(segments)}개 구간, 병합 총 소요 {total_elapsed:.1f}초)", flush=True)
         return True
     finally:
         try:
@@ -1254,6 +1288,13 @@ def main() -> None:
         help="검출된 구간만 코덱 카피로 잘라서 한 파일로 이어붙여 저장. 인자 없으면 원본과 같은 폴더에 원본파일명_merged.mp4 로 저장. 경로/파일명을 주면 그 위치에 저장. 예: --merge 또는 --merge F:\\세경\\result.mp4",
     )
     parser.add_argument(
+        "--merge-workers",
+        type=int,
+        default=2,
+        metavar="N",
+        help="병합 시 구간 추출 병렬 워커 수. 기본 2(네트워크/HDD 권장). 로컬 NVMe면 4~8 시도 가능. 예: --merge-workers 6",
+    )
+    parser.add_argument(
         "--segments-out",
         nargs="?",
         const=True,
@@ -1315,7 +1356,7 @@ def main() -> None:
                 else _merge_output_path_for_input(path)
             )
             print(f"구간 병합 중... (코덱 카피) → {output_path}", flush=True)
-            if not merge_segments(path, segments, output_path, use_gpu):
+            if not merge_segments(path, segments, output_path, use_gpu, merge_workers=args.merge_workers):
                 sys.exit(1)
         return
 
@@ -1439,7 +1480,7 @@ def main() -> None:
             else _merge_output_path_for_input(path)
         )
         print(f"구간 병합 중... (코덱 카피) → {output_path}", flush=True)
-        if not merge_segments(path, segments, output_path, use_gpu):
+        if not merge_segments(path, segments, output_path, use_gpu, merge_workers=args.merge_workers):
             sys.exit(1)
 
 
