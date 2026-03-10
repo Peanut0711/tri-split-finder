@@ -1,0 +1,13 @@
+# Tri-Split Finder (tripartite_section_check.py) 의존성
+# 설치: pip install -r requirements_tripartite.txt
+
+# === 필수 (기본 실행에 필요) ===
+numpy>=1.20
+
+# === 선택 (기능별) ===
+# --verify-export 로 검증 구간 이미지 저장 시 필요
+# opencv-python>=4.5
+
+# GPU 판정 연산 (--cuda 사용 시, NVIDIA CUDA 12.x)
+# pip install cupy-cuda12x
+# CUDA 11.x: cupy-cuda11x

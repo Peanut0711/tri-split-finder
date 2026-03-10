@@ -3,7 +3,7 @@
 
 FHD 영상에서 "화면 정중앙 1/3을 양옆으로 복제한" 구간을 찾아
 시작·종료 타임스탬프를 로그로 출력합니다.
-상단 팝업(별풍선 등)을 피하기 위해 높이(y) 중앙부만 샘플하여 비교합니다.
+상단 팝업을 피하기 위해 높이(y) 중앙부만 샘플하여 비교합니다.
 
 사용: python tripartite_section_check.py input.ts [--workers N] [--cuda]
 필수: ffmpeg, ffprobe (PATH)
@@ -1269,7 +1269,7 @@ def main() -> None:
         type=float,
         default=None,
         metavar="SEC",
-        help="경계 이진 탐색 정밀도(초). 미지정 시 기본값(1.875). 크게 주면 경계 단계가 빨라지나 정확도 완화. 예: 0.5(더 정밀), 1.0",
+        help="경계 이진 탐색 정밀도(초). 미지정 시 기본값(0.9375). 크게 주면 경계 단계가 빨라지나 정확도 완화. 예: 0.5(더 정밀), 1.0",
     )
     parser.add_argument(
         "--align-tolerance",
