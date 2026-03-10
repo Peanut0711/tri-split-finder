@@ -1,8 +1,62 @@
 import sys
 import time
+import os
+import subprocess
+import tempfile
 import numpy as np
 import cv2
-from decord import VideoReader, cpu
+
+
+def _get_video_info_ffprobe(video_path):
+    """ffprobe로 영상 길이(초)와 fps를 반환. decord 미사용으로 초기 로딩 0초."""
+    out = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-show_entries", "stream=r_frame_rate",
+            "-select_streams", "v:0",
+            "-of", "default=noprint_wrappers=1",
+            video_path,
+        ],
+        capture_output=True,
+        text=True,
+        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+    )
+    if out.returncode != 0:
+        raise RuntimeError(f"ffprobe 실패: {out.stderr or out.stdout}")
+    info = {}
+    for line in (out.stdout or "").strip().splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            info[k.strip()] = v.strip()
+    duration_sec = float(info["duration"])
+    rate_str = info["r_frame_rate"]
+    if "/" in rate_str:
+        num, den = rate_str.split("/")
+        fps = float(num) / float(den)
+    else:
+        fps = float(rate_str)
+    return duration_sec, fps
+
+
+def _extract_frame_ffmpeg(video_path, timestamp_sec, out_path):
+    """FFmpeg로 지정 시각에 1프레임만 추출해 out_path에 저장. -ss를 입력 앞에 두어 빠른 seek."""
+    cmd = [
+        "ffmpeg", "-y", "-nostdin",
+        "-ss", str(timestamp_sec),
+        "-i", video_path,
+        "-vframes", "1",
+        "-q:v", "2",
+        out_path,
+    ]
+    r = subprocess.run(
+        cmd,
+        capture_output=True,
+        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(f"FFmpeg 프레임 추출 실패 (t={timestamp_sec}s): {r.stderr.decode(errors='replace')}")
+
 
 def format_time(seconds):
     h = int(seconds // 3600)
@@ -13,15 +67,30 @@ def format_time(seconds):
 
 class SplitVideoDetector:
     def __init__(self, video_path, y_start=540, y_end=720):
-        self.video_path = video_path
-        self.vr = VideoReader(video_path, ctx=cpu(0)) 
-        self.fps = self.vr.get_avg_fps()
-        self.total_frames = len(self.vr)
-        
+        self.video_path = os.path.abspath(video_path)
+        duration_sec, self.fps = _get_video_info_ffprobe(self.video_path)
+        self.total_frames = int(duration_sec * self.fps)
+
         # Y축 안전 영역 (상/하단의 팝업, 자막 등을 피해 비교할 영역)
-        # 팝업 위치에 따라 객체 생성 시 인자로 넘기거나 여기서 직접 수정하세요.
         self.y_start = y_start
         self.y_end = y_end
+
+    def _get_frame_at_index(self, frame_idx):
+        """해당 프레임 인덱스의 1장만 FFmpeg로 추출해 RGB numpy 배열로 반환 (decord 대체)."""
+        timestamp_sec = frame_idx / self.fps
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+            tmp_path = f.name
+        try:
+            _extract_frame_ffmpeg(self.video_path, timestamp_sec, tmp_path)
+            bgr = cv2.imread(tmp_path)
+            if bgr is None:
+                raise RuntimeError(f"프레임 읽기 실패: {tmp_path}")
+            return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
     def find_first_tri_split(self):
         """
@@ -35,7 +104,7 @@ class SplitVideoDetector:
         frame_idx = 0
         
         while frame_idx < self.total_frames:
-            frame = self.vr[frame_idx].asnumpy()
+            frame = self._get_frame_at_index(frame_idx)
             safe_frame = frame[self.y_start:self.y_end]
             
             # 삼분할이 맞는지 판단하기 위해, 왼쪽(0~600)을 템플릿으로 사용하고
@@ -147,7 +216,7 @@ class SplitVideoDetector:
                 while search_right_idx - search_left_idx > self.fps:
                     mid_idx = (search_left_idx + search_right_idx) // 2
                     
-                    mid_frame = self.vr[mid_idx].asnumpy()
+                    mid_frame = self._get_frame_at_index(mid_idx)
                     mid_safe = mid_frame[self.y_start:self.y_end]
                     
                     mid_template = mid_safe[:, 0:600]
@@ -198,10 +267,10 @@ if __name__ == "__main__":
         
     video_file = sys.argv[1]
     
-    print("비디오 파일을 불러오고 인덱싱하는 중... (길이가 긴 ts 영상은 여기서 시간이 많이 걸립니다)")
+    print("ffprobe로 영상 정보 확인 중... (전체 인덱싱 없음, 즉시 시작)")
     init_start = time.time()
     detector = SplitVideoDetector(video_file)
     init_end = time.time()
-    print(f"비디오 로딩 및 준비 완료 (소요 시간: {init_end - init_start:.3f}초)\n")
+    print(f"영상 정보 준비 완료 (소요 시간: {init_end - init_start:.3f}초)\n")
     
     detector.find_first_tri_split()
