@@ -25,12 +25,13 @@ class SplitVideoDetector:
 
     def find_first_tri_split(self):
         """
-        영상을 10초 단위로 듬성듬성 스캔하다가 첫 번째 삼분할 화면을 발견하면
+        영상을 30초 단위로 듬성듬성 스캔하다가 첫 번째 삼분할 화면을 발견하면
         시간과 양쪽 분할선의 정확한 X 좌표를 출력합니다.
         """
         start_time = time.time()
         
-        jump_frames = int(10 * self.fps)
+        # 30초 간격으로 스캔 (초당 프레임수 * 30)
+        jump_frames = int(30 * self.fps)
         frame_idx = 0
         
         while frame_idx < self.total_frames:
@@ -133,10 +134,42 @@ class SplitVideoDetector:
                 print(f"[디버그] 디버그 파일이 다음 경로에 저장되었습니다: {save_dir}")
                 # ==========================================================
                 
-                elapsed_time = time.time() - start_time
-                print(f"(탐색 소요 시간: {elapsed_time:.3f}초)")
+                # ----------------------------------------------------------
+                # 정확한 시작 지점을 찾기 위한 이진 탐색 (Binary Search)
+                # ----------------------------------------------------------
+                search_left_idx = max(0, frame_idx - jump_frames)
+                search_right_idx = frame_idx
                 
-                return time_str, left_x_end, right_x_start
+                print(f"[탐색] {time_str} 부근에서 삼분할 감지. 대략적인 시작 지점 역추적 (1초 정밀도)...")
+                
+                exact_start_idx = frame_idx
+                # (수정) 프레임 단위 매칭이 아니라 1초(fps) 오차 범위 내로 들어오면 탐색 중단
+                while search_right_idx - search_left_idx > self.fps:
+                    mid_idx = (search_left_idx + search_right_idx) // 2
+                    
+                    mid_frame = self.vr[mid_idx].asnumpy()
+                    mid_safe = mid_frame[self.y_start:self.y_end]
+                    
+                    mid_template = mid_safe[:, 0:600]
+                    mid_search = mid_safe[:, 1260:1900]
+                    
+                    res_mid = cv2.matchTemplate(mid_search, mid_template, cv2.TM_CCOEFF_NORMED)
+                    _, mid_max_val, _, _ = cv2.minMaxLoc(res_mid)
+                    
+                    if mid_max_val >= 0.95:
+                        exact_start_idx = mid_idx
+                        search_right_idx = mid_idx
+                    else:
+                        search_left_idx = mid_idx
+                        
+                exact_time_sec = exact_start_idx / self.fps
+                exact_time_str = format_time(exact_time_sec)
+                
+                elapsed_time = time.time() - start_time
+                print(f"[완료] 대략적인 삼분할 시작 시간은 {exact_time_str} 근처입니다!")
+                print(f"(총 탐색 소요 시간: {elapsed_time:.3f}초)")
+                
+                return exact_time_str, exact_start_idx, left_x_end, right_x_start
                 
             frame_idx += jump_frames
             
