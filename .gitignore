@@ -1,3 +1,5 @@
 debug_frames/
 antigravity/picture/
 cursor/Logs/
+antigravity/__pycache__/
+antigravity/logs/

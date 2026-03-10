@@ -20,6 +20,7 @@ import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
+from multiprocessing import Manager
 from pathlib import Path
 
 import numpy as np
@@ -327,6 +328,95 @@ def is_tripartite_frame(
     return _is_tripartite_frame_cpu(frame, left_right_only, align_tolerance_px)
 
 
+def _is_tripartite_frame_fixed_L_cpu(
+    frame: np.ndarray, left_width: int, left_right_only: bool
+) -> bool:
+    """고정 좌측 너비 L로 crop → split → 좌·우 MSE 한 번만 계산 (Phase 2 경량 판정)."""
+    cropped = crop_middle_y(frame)
+    w = cropped.shape[1]
+    if left_width < 1 or left_width >= w:
+        return False
+    left, center, right = split_third_with_left_width(cropped, left_width)
+    min_w = min(left.shape[1], center.shape[1], right.shape[1])
+    if min_w < 1:
+        return False
+    left = left[:, :min_w]
+    center = center[:, :min_w]
+    right = right[:, :min_w]
+    if left_right_only:
+        return mse(left, right) <= MSE_THRESHOLD
+    return (
+        mse(left, center) <= MSE_THRESHOLD and mse(right, center) <= MSE_THRESHOLD
+    )
+
+
+def _is_tripartite_frame_fixed_L_gpu(
+    frame: np.ndarray, left_width: int, left_right_only: bool
+) -> bool:
+    """GPU: 고정 L로 좌·우 MSE 한 번만 (Phase 2 경량 판정)."""
+    if not CUPY_AVAILABLE:
+        return _is_tripartite_frame_fixed_L_cpu(frame, left_width, left_right_only)
+    cropped = crop_middle_y(frame)
+    g = cp.asarray(cropped)
+    w = g.shape[1]
+    if left_width < 1 or left_width >= w:
+        return False
+    left = g[:, :left_width].astype(cp.float64)
+    right = g[:, w - left_width :].astype(cp.float64)
+    min_c = min(left.shape[1], right.shape[1])
+    if min_c < 1:
+        return False
+    left = left[:, :min_c]
+    right = right[:, :min_c]
+    if left_right_only:
+        return float(cp.mean((left - right) ** 2).item()) <= MSE_THRESHOLD
+    center = g[:, left_width : w - left_width].astype(cp.float64)
+    min_c = min(left.shape[1], center.shape[1], right.shape[1])
+    if min_c < 1:
+        return False
+    lc, cc, rc = left[:, :min_c], center[:, :min_c], right[:, :min_c]
+    return (
+        float(cp.mean((lc - cc) ** 2).item()) <= MSE_THRESHOLD
+        and float(cp.mean((rc - cc) ** 2).item()) <= MSE_THRESHOLD
+    )
+
+
+def is_tripartite_frame_fixed_L(
+    frame: np.ndarray,
+    left_width: int | None,
+    left_right_only: bool = True,
+    use_gpu: bool = False,
+) -> bool:
+    """
+    Phase 2: 이미 확보한 좌측 너비 L로 한 번만 split 후 MSE 판정 (정렬 탐색 없음).
+    left_width는 crop 후 가로 픽셀 수 기준.
+    """
+    if left_width is None or left_width < 1:
+        return False
+    if use_gpu and CUPY_AVAILABLE:
+        return _is_tripartite_frame_fixed_L_gpu(frame, left_width, left_right_only)
+    return _is_tripartite_frame_fixed_L_cpu(frame, left_width, left_right_only)
+
+
+def get_tripartite_and_best_L(
+    frame: np.ndarray,
+    left_right_only: bool = True,
+    use_gpu: bool = False,
+    align_tolerance_px: int | None = None,
+) -> tuple[bool, int | None]:
+    """
+    삼분할 여부와 해당 프레임에서의 최적 좌측 너비(best_L) 반환.
+    Phase 2: 첫 삼분할 프레임에서 이걸 호출해 locked_L을 확보할 때 사용.
+    """
+    ok, d = get_tripartite_mse(
+        frame, left_right_only, use_gpu, align_tolerance_px=align_tolerance_px
+    )
+    best = d.get("best_L")
+    if best is not None:
+        best = int(round(best))
+    return (ok, best)
+
+
 def get_tripartite_mse(
     frame: np.ndarray,
     left_right_only: bool = True,
@@ -622,10 +712,11 @@ def _print_progress(
 
 
 def _coarse_worker(args: tuple) -> tuple[float, bool]:
-    """멀티프로세싱용: (path_str, t, width, height, left_right_only, use_gpu, scale_width?, cache_dir?, align_tolerance_px?) → (t, is_tripartite).
-    scale_width가 None이 아니면 코스 스캔만 저해상도. cache_dir이 있으면 해당 프레임을 .npy로 저장."""
+    """멀티프로세싱용: (path_str, t, width, height, left_right_only, use_gpu, scale_width?, cache_dir?, align_tolerance_px?, shared?) → (t, is_tripartite).
+    shared가 있으면: 이미 locked_L이 설정돼 있으면 고정 L만 사용, 없으면 전체 탐색 후 삼분할이면 shared에 L 저장(Phase2)."""
     path_str, t, width, height, left_right_only, use_gpu, scale_width, cache_dir = args[:8]
     align_tol_px = int(args[8]) if len(args) > 8 and args[8] is not None else None
+    shared = args[9] if len(args) > 9 else None
     path = Path(path_str)
     frame = extract_frame(path, t, width, height, use_gpu, scale_width=scale_width)
     if frame is None:
@@ -636,7 +727,22 @@ def _coarse_worker(args: tuple) -> tuple[float, bool]:
             np.save(out, frame)
         except (OSError, ValueError):
             pass
-    return (t, is_tripartite_frame(frame, left_right_only, use_gpu, align_tolerance_px=align_tol_px))
+    if shared is not None and shared.get("locked_L") is not None:
+        is_tri = is_tripartite_frame_fixed_L(
+            frame, shared["locked_L"], left_right_only, use_gpu=use_gpu
+        )
+        return (t, is_tri)
+    is_tri, best_L = get_tripartite_and_best_L(
+        frame, left_right_only, use_gpu, align_tolerance_px=align_tol_px
+    )
+    if is_tri and best_L is not None:
+        try:
+            shared["locked_L"] = best_L
+            shared["locked_at_t"] = t
+            shared["crop_w"] = frame.shape[1]
+        except (TypeError, KeyError):
+            pass
+    return (t, is_tri)
 
 
 def _get_frame_for_check(
@@ -839,16 +945,27 @@ def find_segments(
         if duration > 0 and (not ts or ts[-1] < duration - 0.5):
             ts.append(max(0.0, duration - 0.1))
         total_points = len(ts)
-        worker_args = [
-            (path_str, t, width, height, left_right_only, use_gpu, scale_w, cache_dir_str, align_tolerance_px)
-            for t in ts
-        ]
+        worker_args: list[tuple]
+        if n_workers <= 1:
+            worker_args = [
+                (path_str, t, width, height, left_right_only, use_gpu, scale_w, cache_dir_str, align_tolerance_px)
+                for t in ts
+            ]
+        else:
+            manager = Manager()
+            shared_phase2 = manager.dict()
+            worker_args = [
+                (path_str, t, width, height, left_right_only, use_gpu, scale_w, cache_dir_str, align_tolerance_px, shared_phase2)
+                for t in ts
+            ]
         timings["시점 목록"] = time.perf_counter() - t0
 
         coarse_results: list[tuple[float, bool]] = []
         scan_start = time.perf_counter()
+        shared_phase2_ref = worker_args[0][9] if n_workers > 1 and len(worker_args[0]) > 9 else None
 
         if n_workers <= 1:
+            locked_L: int | None = None  # Phase 2: 첫 삼분할에서 확보한 고정 좌측 너비
             for i, (_path_s, t, w, h, lr, ug, sw, _cd, align_tol) in enumerate(worker_args):
                 frame = extract_frame(path, t, w, h, ug, scale_width=sw)
                 if frame is None:
@@ -859,7 +976,24 @@ def find_segments(
                             np.save(cache_dir / f"frame_{t:.3f}.npy", frame)
                         except (OSError, ValueError):
                             pass
-                    coarse_results.append((t, is_tripartite_frame(frame, lr, ug, align_tolerance_px=align_tol)))
+                    if locked_L is None:
+                        is_tri, best_L = get_tripartite_and_best_L(
+                            frame, lr, ug, align_tolerance_px=align_tol
+                        )
+                        if is_tri and best_L is not None:
+                            locked_L = best_L
+                            cw = frame.shape[1]
+                            print(
+                                f"  [Phase2] 시점 {format_ts(t)} 에서 첫 삼분할 감지 → "
+                                f"좌측 경계 L={locked_L}px, 우측 경계 R={cw - locked_L}px (가로 {cw}px 기준), 이후 고정 좌표+absdiff만 사용",
+                                flush=True,
+                            )
+                        coarse_results.append((t, is_tri))
+                    else:
+                        is_tri = is_tripartite_frame_fixed_L(
+                            frame, locked_L, lr, use_gpu=ug
+                        )
+                        coarse_results.append((t, is_tri))
                 if (i + 1) % 30 == 0:
                     _print_progress(ts[i], duration, scan_start, i + 1, total_points)
         else:
@@ -873,6 +1007,16 @@ def find_segments(
             sort_start = time.perf_counter()
             coarse_results.sort(key=lambda x: x[0])
             timings["코스 정렬"] = time.perf_counter() - sort_start
+            if shared_phase2_ref is not None and shared_phase2_ref.get("locked_L") is not None:
+                locked_at = shared_phase2_ref.get("locked_at_t", 0.0)
+                locked_L = shared_phase2_ref["locked_L"]
+                crop_w = shared_phase2_ref.get("crop_w", 0) or (scale_w if scale_w else width)
+                right_L = crop_w - locked_L
+                print(
+                    f"  [Phase2] 병렬 워커 중 한 곳에서 삼분할 감지 → 시점 {format_ts(locked_at)} 에서 "
+                    f"좌측 경계 L={locked_L}px, 우측 경계 R={right_L}px (가로 {crop_w}px 기준), 이후 고정 좌표+absdiff 사용",
+                    flush=True,
+                )
 
         scan_elapsed = time.perf_counter() - scan_start
         timings["코스 스캔"] = scan_elapsed
@@ -1409,29 +1553,144 @@ def main() -> None:
             sys.exit(1)
 
         use_gpu = getattr(args, "cuda", False)
-    segments_in = getattr(args, "segments_in", None)
-    segments_out = getattr(args, "segments_out", None)
+        segments_in = getattr(args, "segments_in", None)
+        segments_out = getattr(args, "segments_out", None)
 
-    # --segments-in: 파일에서 구간 목록 읽어서 출력·병합만 (검출 생략)
-    if segments_in is not None:
-        seg_file = (
-            path.parent / (path.stem + "_seg.txt")
-            if segments_in is True
-            else Path(segments_in).resolve()
-        )
-        if not seg_file.is_file():
-            print(f"[오류] 구간 목록 파일을 찾을 수 없습니다: {seg_file}", file=sys.stderr)
-            sys.exit(1)
+        # --segments-in: 파일에서 구간 목록 읽어서 출력·병합만 (검출 생략)
+        if segments_in is not None:
+            seg_file = (
+                path.parent / (path.stem + "_seg.txt")
+                if segments_in is True
+                else Path(segments_in).resolve()
+            )
+            if not seg_file.is_file():
+                print(f"[오류] 구간 목록 파일을 찾을 수 없습니다: {seg_file}", file=sys.stderr)
+                sys.exit(1)
+            try:
+                segments = load_segments_from_file(seg_file)
+            except FileNotFoundError as e:
+                print(f"[오류] {e}", file=sys.stderr)
+                sys.exit(1)
+            if not segments:
+                print("[오류] 구간 목록 파일에 유효한 구간이 없습니다.", file=sys.stderr)
+                sys.exit(1)
+            print(f"입력: {path}")
+            print(f"구간 목록: {seg_file}  (총 {len(segments)}개)")
+            print("삼분할 구간:")
+            total_length_sec = 0.0
+            for i, (start, end) in enumerate(segments, 1):
+                seg_len = end - start
+                total_length_sec += seg_len
+                print(f"  [{i}] {format_ts(start)} ~ {format_ts(end)}  (길이 {seg_len:.1f}초)")
+            print("-" * 50)
+            print(f"길이 총합: {total_length_sec:.1f}초  ({_format_elapsed(total_length_sec)})")
+            if args.merge is not None:
+                output_path = (
+                    Path(args.merge).resolve()
+                    if args.merge is not True
+                    else _merge_output_path_for_input(path)
+                )
+                print(f"구간 병합 중... (코덱 카피) → {output_path}", flush=True)
+                if not merge_segments(path, segments, output_path, use_gpu, merge_workers=args.merge_workers):
+                    sys.exit(1)
+            return
+
+        print(f"입력: {path}")
+        meta_start = time.perf_counter()
         try:
-            segments = load_segments_from_file(seg_file)
-        except FileNotFoundError as e:
+            duration, width, height = get_video_info(path)
+        except RuntimeError as e:
             print(f"[오류] {e}", file=sys.stderr)
             sys.exit(1)
+        meta_elapsed = time.perf_counter() - meta_start
+
+        left_right_only = not args.strict
+
+        # --verify: 지정 구간만 샘플링해 삼분할 여부·MSE 리포팅 후 종료
+        if args.verify is not None:
+            try:
+                start_sec = parse_ts_to_sec(args.verify[0])
+                end_sec = parse_ts_to_sec(args.verify[1])
+            except ValueError as e:
+                print(f"[오류] {e}", file=sys.stderr)
+                sys.exit(1)
+            interval = max(0.5, getattr(args, "verify_interval", 5.0))
+            print(f"길이: {format_ts(duration)} ({duration:.1f}초), 해상도: {width}x{height}")
+            print(f"비교 영역: 높이 {Y_CROP_RATIO_START*100:.0f}% ~ {Y_CROP_RATIO_END*100:.0f}%, 모드: {'좌·우만' if left_right_only else '좌=중앙=우'}")
+            print("-" * 50)
+            verify_segment(
+                path, start_sec, end_sec, width, height,
+                interval, left_right_only, use_gpu,
+                export_dir=getattr(args, "verify_export", None),
+                export_max=max(0, getattr(args, "verify_export_max", 20)),
+                export_only_x=getattr(args, "verify_export_only_x", False),
+                align_tolerance_px=args.align_tolerance,
+            )
+            return
+
+        run_start = time.perf_counter()
+        min_dur = 0.0 if args.no_min_duration else MIN_SEGMENT_DURATION
+        coarse = max(1.0, args.coarse_interval)
+        workers = max(0, args.workers)
+        print(f"길이: {format_ts(duration)} ({duration:.1f}초), 해상도: {width}x{height}")
+        print(f"비교 영역: 높이 {Y_CROP_RATIO_START*100:.0f}% ~ {Y_CROP_RATIO_END*100:.0f}% (상단 팝업 제외)")
+        print(f"모드: {'좌·우만 비교 (중앙 무시)' if left_right_only else '좌=중앙=우 모두 비교 (strict)'}")
+        gpu_desc = "GPU(CUDA 디코딩" + (", CuPy 판정" if CUPY_AVAILABLE else "") + ")" if use_gpu else "CPU"
+        coarse_scale = getattr(args, "coarse_scale", None)
+        coarse_scale = coarse_scale if coarse_scale in COARSE_SCALE_WIDTHS else None
+        coarse_res_str = ""
+        if coarse_scale is not None:
+            coarse_h = round(height * coarse_scale / width)
+            coarse_res_str = f", 코스 해상도 {coarse_scale}×{coarse_h} (저해상도)"
+        print(f"코스 스캔: 간격 {coarse}s, 병렬 프로세스 {workers}개, 자원 {gpu_desc}{coarse_res_str}")
+        print("-" * 50)
+
+        use_coarse_cache = getattr(args, "coarse_cache", False)
+        segments, phase_timings = find_segments(
+            path, duration, width, height,
+            min_duration_sec=min_dur,
+            coarse_interval_sec=coarse,
+            left_right_only=left_right_only,
+            n_workers=workers,
+            use_gpu=use_gpu,
+            coarse_scale_width=coarse_scale,
+            use_coarse_cache=use_coarse_cache,
+            boundary_tolerance_sec=args.boundary_tolerance,
+            align_tolerance_px=args.align_tolerance,
+        )
+
+        run_elapsed = time.perf_counter() - run_start
+        # 파이프라인 단계별 소요 시간 요약 (효율화 분석용)
+        all_phases = [
+            "메타(ffprobe)",
+            "시점 목록",
+            "코스 스캔",
+            "코스 정렬",
+            "후보 구간 수집",
+            "경계 정밀화",
+            "병합",
+            "최소 길이 필터",
+        ]
+        full_timings: dict[str, float] = {"메타(ffprobe)": meta_elapsed, **phase_timings}
+        total_sec = sum(full_timings.get(p, 0.0) for p in all_phases)
+        if total_sec <= 0:
+            total_sec = run_elapsed
+        name_width = max(len(p) for p in all_phases)
+        time_width = 10  # "123.45초" 또는 "12분 34초" 수준
+        print("소요 시간 요약 (파이프라인):")
+        for name in all_phases:
+            sec = full_timings.get(name, 0.0)
+            if sec <= 0 and name != "메타(ffprobe)":
+                continue
+            pct = (sec / total_sec * 100) if total_sec > 0 else 0
+            print(f"  {name:<{name_width}}  {_format_elapsed(sec):>{time_width}}  ({pct:>5.1f}%)", flush=True)
+        print(f"  {'─ 합계':<{name_width}}  {_format_elapsed(total_sec):>{time_width}}  (전체 실행: {_format_elapsed(run_elapsed)})", flush=True)
+        print("-" * 50)
+
         if not segments:
-            print("[오류] 구간 목록 파일에 유효한 구간이 없습니다.", file=sys.stderr)
-            sys.exit(1)
-        print(f"입력: {path}")
-        print(f"구간 목록: {seg_file}  (총 {len(segments)}개)")
+            print("삼분할 구간이 없습니다.")
+            return
+
         print("삼분할 구간:")
         total_length_sec = 0.0
         for i, (start, end) in enumerate(segments, 1):
@@ -1439,7 +1698,18 @@ def main() -> None:
             total_length_sec += seg_len
             print(f"  [{i}] {format_ts(start)} ~ {format_ts(end)}  (길이 {seg_len:.1f}초)")
         print("-" * 50)
+        print(f"총 {len(segments)}개 구간  (전체 소요: {_format_elapsed(run_elapsed)})")
         print(f"길이 총합: {total_length_sec:.1f}초  ({_format_elapsed(total_length_sec)})")
+
+        if segments_out is not None:
+            out_path = (
+                _seg_output_path_for_input(path)
+                if segments_out is True
+                else Path(segments_out).resolve()
+            )
+            write_segments_to_file(segments, out_path)
+            print(f"구간 목록 저장: {out_path}  (편집 후 --segments-in으로 읽어 병합 가능)", flush=True)
+
         if args.merge is not None:
             output_path = (
                 Path(args.merge).resolve()
@@ -1449,132 +1719,10 @@ def main() -> None:
             print(f"구간 병합 중... (코덱 카피) → {output_path}", flush=True)
             if not merge_segments(path, segments, output_path, use_gpu, merge_workers=args.merge_workers):
                 sys.exit(1)
-        return
-
-    print(f"입력: {path}")
-    meta_start = time.perf_counter()
-    try:
-        duration, width, height = get_video_info(path)
-    except RuntimeError as e:
-        print(f"[오류] {e}", file=sys.stderr)
-        sys.exit(1)
-    meta_elapsed = time.perf_counter() - meta_start
-
-    left_right_only = not args.strict
-
-    # --verify: 지정 구간만 샘플링해 삼분할 여부·MSE 리포팅 후 종료
-    if args.verify is not None:
-        try:
-            start_sec = parse_ts_to_sec(args.verify[0])
-            end_sec = parse_ts_to_sec(args.verify[1])
-        except ValueError as e:
-            print(f"[오류] {e}", file=sys.stderr)
-            sys.exit(1)
-        interval = max(0.5, getattr(args, "verify_interval", 5.0))
-        print(f"길이: {format_ts(duration)} ({duration:.1f}초), 해상도: {width}x{height}")
-        print(f"비교 영역: 높이 {Y_CROP_RATIO_START*100:.0f}% ~ {Y_CROP_RATIO_END*100:.0f}%, 모드: {'좌·우만' if left_right_only else '좌=중앙=우'}")
-        print("-" * 50)
-        verify_segment(
-            path, start_sec, end_sec, width, height,
-            interval, left_right_only, use_gpu,
-            export_dir=getattr(args, "verify_export", None),
-            export_max=max(0, getattr(args, "verify_export_max", 20)),
-            export_only_x=getattr(args, "verify_export_only_x", False),
-            align_tolerance_px=args.align_tolerance,
-        )
-        return
-
-    run_start = time.perf_counter()
-    min_dur = 0.0 if args.no_min_duration else MIN_SEGMENT_DURATION
-    coarse = max(1.0, args.coarse_interval)
-    workers = max(0, args.workers)
-    print(f"길이: {format_ts(duration)} ({duration:.1f}초), 해상도: {width}x{height}")
-    print(f"비교 영역: 높이 {Y_CROP_RATIO_START*100:.0f}% ~ {Y_CROP_RATIO_END*100:.0f}% (상단 팝업 제외)")
-    print(f"모드: {'좌·우만 비교 (중앙 무시)' if left_right_only else '좌=중앙=우 모두 비교 (strict)'}")
-    gpu_desc = "GPU(CUDA 디코딩" + (", CuPy 판정" if CUPY_AVAILABLE else "") + ")" if use_gpu else "CPU"
-    coarse_scale = getattr(args, "coarse_scale", None)
-    coarse_scale = coarse_scale if coarse_scale in COARSE_SCALE_WIDTHS else None
-    coarse_res_str = ""
-    if coarse_scale is not None:
-        coarse_h = round(height * coarse_scale / width)
-        coarse_res_str = f", 코스 해상도 {coarse_scale}×{coarse_h} (저해상도)"
-    print(f"코스 스캔: 간격 {coarse}s, 병렬 프로세스 {workers}개, 자원 {gpu_desc}{coarse_res_str}")
-    print("-" * 50)
-
-    use_coarse_cache = getattr(args, "coarse_cache", False)
-    segments, phase_timings = find_segments(
-        path, duration, width, height,
-        min_duration_sec=min_dur,
-        coarse_interval_sec=coarse,
-        left_right_only=left_right_only,
-        n_workers=workers,
-        use_gpu=use_gpu,
-        coarse_scale_width=coarse_scale,
-        use_coarse_cache=use_coarse_cache,
-        boundary_tolerance_sec=args.boundary_tolerance,
-        align_tolerance_px=args.align_tolerance,
-    )
-
-    run_elapsed = time.perf_counter() - run_start
-    # 파이프라인 단계별 소요 시간 요약 (효율화 분석용)
-    all_phases = [
-        "메타(ffprobe)",
-        "시점 목록",
-        "코스 스캔",
-        "코스 정렬",
-        "후보 구간 수집",
-        "경계 정밀화",
-        "병합",
-        "최소 길이 필터",
-    ]
-    full_timings: dict[str, float] = {"메타(ffprobe)": meta_elapsed, **phase_timings}
-    total_sec = sum(full_timings.get(p, 0.0) for p in all_phases)
-    if total_sec <= 0:
-        total_sec = run_elapsed
-    name_width = max(len(p) for p in all_phases)
-    time_width = 10  # "123.45초" 또는 "12분 34초" 수준
-    print("소요 시간 요약 (파이프라인):")
-    for name in all_phases:
-        sec = full_timings.get(name, 0.0)
-        if sec <= 0 and name != "메타(ffprobe)":
-            continue
-        pct = (sec / total_sec * 100) if total_sec > 0 else 0
-        print(f"  {name:<{name_width}}  {_format_elapsed(sec):>{time_width}}  ({pct:>5.1f}%)", flush=True)
-    print(f"  {'─ 합계':<{name_width}}  {_format_elapsed(total_sec):>{time_width}}  (전체 실행: {_format_elapsed(run_elapsed)})", flush=True)
-    print("-" * 50)
-
-    if not segments:
-        print("삼분할 구간이 없습니다.")
-        return
-
-    print("삼분할 구간:")
-    total_length_sec = 0.0
-    for i, (start, end) in enumerate(segments, 1):
-        seg_len = end - start
-        total_length_sec += seg_len
-        print(f"  [{i}] {format_ts(start)} ~ {format_ts(end)}  (길이 {seg_len:.1f}초)")
-    print("-" * 50)
-    print(f"총 {len(segments)}개 구간  (전체 소요: {_format_elapsed(run_elapsed)})")
-    print(f"길이 총합: {total_length_sec:.1f}초  ({_format_elapsed(total_length_sec)})")
-
-    if segments_out is not None:
-        out_path = (
-            _seg_output_path_for_input(path)
-            if segments_out is True
-            else Path(segments_out).resolve()
-        )
-        write_segments_to_file(segments, out_path)
-        print(f"구간 목록 저장: {out_path}  (편집 후 --segments-in으로 읽어 병합 가능)", flush=True)
-
-    if args.merge is not None:
-        output_path = (
-            Path(args.merge).resolve()
-            if args.merge is not True
-            else _merge_output_path_for_input(path)
-        )
-        print(f"구간 병합 중... (코덱 카피) → {output_path}", flush=True)
-        if not merge_segments(path, segments, output_path, use_gpu, merge_workers=args.merge_workers):
-            sys.exit(1)
+    finally:
+        sys.stdout = _orig_stdout
+        sys.stderr = _orig_stderr
+        log_file.close()
 
 
 if __name__ == "__main__":
