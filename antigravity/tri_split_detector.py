@@ -65,6 +65,10 @@ def format_time(seconds):
     ms = int((seconds - int(seconds)) * 1000)
     return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
 
+# matchTemplate 연산 가속: 이 배율로 축소한 뒤 검사 (1=원본, 4=1/4 해상도)
+DETECT_SCALE = 4
+
+
 class SplitVideoDetector:
     def __init__(self, video_path, y_start=540, y_end=720):
         self.video_path = os.path.abspath(video_path)
@@ -98,7 +102,8 @@ class SplitVideoDetector:
         시간과 양쪽 분할선의 정확한 X 좌표를 출력합니다.
         """
         start_time = time.time()
-        
+        print(f"[탐색] matchTemplate/col_diff는 해상도 1/{DETECT_SCALE}로 축소하여 연산합니다.")
+
         # 30초 간격으로 스캔 (초당 프레임수 * 30)
         jump_frames = int(30 * self.fps)
         frame_idx = 0
@@ -106,40 +111,45 @@ class SplitVideoDetector:
         while frame_idx < self.total_frames:
             frame = self._get_frame_at_index(frame_idx)
             safe_frame = frame[self.y_start:self.y_end]
-            
-            # 삼분할이 맞는지 판단하기 위해, 왼쪽(0~600)을 템플릿으로 사용하고
-            # 오른쪽 프레임 기준선(1280 +- 20 범위인 1260~1300) 부근에서 위치를 매칭
-            template = safe_frame[:, 0:600]
-            # 탐색 영역 시작은 1260, 폭은 템플릿의 이동폭 40 + 템플릿 폭 600 = 640. 끝점 1900.
-            search_area = safe_frame[:, 1260:1900]
-            
+            # 연산 속도: 1/DETECT_SCALE 해상도로 줄인 뒤 템플릿/차이 검사
+            h, w = safe_frame.shape[:2]
+            safe_small = cv2.resize(
+                safe_frame, (w // DETECT_SCALE, h // DETECT_SCALE), interpolation=cv2.INTER_AREA
+            )
+            ws = w // DETECT_SCALE  # 480 for 1920
+
+            # 삼분할 판단: 왼쪽(0~600) 템플릿을 오른쪽(1260~1900)에서 매칭
+            template = safe_small[:, 0 : 600 // DETECT_SCALE]
+            search_area = safe_small[:, 1260 // DETECT_SCALE : 1900 // DETECT_SCALE]
+
             res = cv2.matchTemplate(search_area, template, cv2.TM_CCOEFF_NORMED)
             _, max_val, _, max_loc = cv2.minMaxLoc(res)
-            
-            # 일치율이 0.95 이상이면 삼분할 공간으로 간주
+
+            # 일치율 0.95 이상이면 삼분할로 간주
             if max_val >= 0.95:
-                # 1. 우측 분할 영역(Right) 시작 좌표 찾기
-                # search_area가 1260부터 시작, 템플릿은 0부터 시작하므로 그대로 더함
-                right_x_start = 1260 + max_loc[0]
-                
-                # 2. 좌측 분할 영역(Left) 끝 좌표 찾기
+                # 1. 우측 분할 시작 X (축소 좌표 → 원본)
+                right_x_start = 1260 + max_loc[0] * DETECT_SCALE
+
+                # 2. 좌측 분할선 끝 X (축소 영역에서 col_diff 후 원본 좌표로 복원)
                 compare_width = 1920 - right_x_start
-                left_region = safe_frame[:, 0:compare_width]
-                right_region = safe_frame[:, right_x_start:1920]
-                
+                cw_small = compare_width // DETECT_SCALE
+                rs = right_x_start // DETECT_SCALE
+                left_region = safe_small[:, 0:cw_small]
+                right_region = safe_small[:, rs : rs + cw_small]
+
                 diff = np.abs(left_region.astype(np.int16) - right_region.astype(np.int16))
                 col_diff = np.mean(diff, axis=0)
-                
-                # 무조건 좌측 분할선은 640 +- 20 (620 ~ 660 범위) 안에 존재한다는 가정 추가
-                search_start = 620
-                search_end = min(660, compare_width)
-                
+
+                # 좌측 분할선 탐색 구간 640±20 → 축소 인덱스
+                search_start = 620 // DETECT_SCALE
+                search_end = min(660, compare_width) // DETECT_SCALE
+
                 if search_end > search_start:
                     mismatch_indices = np.where(col_diff[search_start:search_end] > 15.0)[0]
                     if len(mismatch_indices) > 0:
-                        left_x_end = search_start + mismatch_indices[0]
+                        left_x_end = (search_start + mismatch_indices[0]) * DETECT_SCALE
                     else:
-                        left_x_end = search_end
+                        left_x_end = search_end * DETECT_SCALE
                 else:
                     left_x_end = compare_width
                 
@@ -155,10 +165,11 @@ class SplitVideoDetector:
                 # 1) Y축 탐색영역 (초록색 상자)
                 cv2.rectangle(debug_img, (0, self.y_start), (1920, self.y_end), (0, 255, 0), 2)
                 
-                # 2) 템플릿 매칭 찾은 영역 (파란색 상자)
-                tw = template.shape[1]
-                cv2.rectangle(debug_img, (1260 + max_loc[0], self.y_start), 
-                              (1260 + max_loc[0] + tw, self.y_end), (0, 0, 255), 3)
+                # 2) 템플릿 매칭 찾은 영역 (파란색 상자, 원본 좌표)
+                tw_orig = 600
+                rx = 1260 + max_loc[0] * DETECT_SCALE
+                cv2.rectangle(debug_img, (rx, self.y_start),
+                              (rx + tw_orig, self.y_end), (0, 0, 255), 3)
                               
                 # 3) 계산된 분할선 표시 (빨간색 두꺼운 선)
                 cv2.line(debug_img, (left_x_end, 0), (left_x_end, 1080), (255, 0, 0), 4)
@@ -179,14 +190,14 @@ class SplitVideoDetector:
                 
                 cv2.imwrite(frame_path, cv2.cvtColor(debug_img, cv2.COLOR_RGB2BGR))
                 
-                # 5) 오차(diff) 배열 값 그래프 렌더링 (matplotlib 활용, 없으면 패스)
+                # 5) 오차(diff) 배열 값 그래프 렌더링 (축소 좌표이므로 x는 컬럼 인덱스)
                 try:
                     import matplotlib.pyplot as plt
                     plt.figure(figsize=(10, 4))
                     plt.plot(col_diff, label="Column Diff")
                     plt.axhline(y=15.0, color='r', linestyle='--', label="Threshold (15.0)")
-                    plt.axvline(x=left_x_end, color='g', linestyle='-', label=f"Detected Left: {left_x_end}")
-                    plt.axvspan(620, 660, color='yellow', alpha=0.3, label='Search Zone (640+-20)')
+                    plt.axvline(x=left_x_end // DETECT_SCALE, color='g', linestyle='-', label=f"Detected Left: {left_x_end}")
+                    plt.axvspan(620 // DETECT_SCALE, 660 // DETECT_SCALE, color='yellow', alpha=0.3, label='Search Zone (640+-20)')
                     plt.title(f"Column Difference Graph at {time_str}")
                     plt.xlabel("X Coordinate (relative to Left 0)")
                     plt.ylabel("Mean Pixel Abs Diff")
@@ -212,16 +223,16 @@ class SplitVideoDetector:
                 print(f"[탐색] {time_str} 부근에서 삼분할 감지. 대략적인 시작 지점 역추적 (1초 정밀도)...")
                 
                 exact_start_idx = frame_idx
-                # (수정) 프레임 단위 매칭이 아니라 1초(fps) 오차 범위 내로 들어오면 탐색 중단
                 while search_right_idx - search_left_idx > self.fps:
                     mid_idx = (search_left_idx + search_right_idx) // 2
-                    
                     mid_frame = self._get_frame_at_index(mid_idx)
                     mid_safe = mid_frame[self.y_start:self.y_end]
-                    
-                    mid_template = mid_safe[:, 0:600]
-                    mid_search = mid_safe[:, 1260:1900]
-                    
+                    hm, wm = mid_safe.shape[:2]
+                    mid_small = cv2.resize(
+                        mid_safe, (wm // DETECT_SCALE, hm // DETECT_SCALE), interpolation=cv2.INTER_AREA
+                    )
+                    mid_template = mid_small[:, 0 : 600 // DETECT_SCALE]
+                    mid_search = mid_small[:, 1260 // DETECT_SCALE : 1900 // DETECT_SCALE]
                     res_mid = cv2.matchTemplate(mid_search, mid_template, cv2.TM_CCOEFF_NORMED)
                     _, mid_max_val, _, _ = cv2.minMaxLoc(res_mid)
                     
