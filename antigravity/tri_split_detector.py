@@ -96,6 +96,71 @@ class SplitVideoDetector:
             except OSError:
                 pass
 
+    def _is_tri_split_at_frame(self, frame):
+        """
+        한 프레임이 삼분할 화면인지 여부만 판별. (좌측 템플릿이 우측과 0.95 이상 일치하면 True)
+        frame: RGB numpy array (H, W, 3)
+        """
+        safe_frame = frame[self.y_start : self.y_end]
+        h, w = safe_frame.shape[:2]
+        safe_small = cv2.resize(
+            safe_frame, (w // DETECT_SCALE, h // DETECT_SCALE), interpolation=cv2.INTER_AREA
+        )
+        template = safe_small[:, 0 : 600 // DETECT_SCALE]
+        search_area = safe_small[:, 1260 // DETECT_SCALE : 1900 // DETECT_SCALE]
+        res = cv2.matchTemplate(search_area, template, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, _ = cv2.minMaxLoc(res)
+        return max_val >= 0.95
+
+    def scan_all_segments_coarse(self, jump_sec=30):
+        """
+        영상 전체를 점프 스캔하여 삼분할 구간을 대략적으로 찾습니다.
+        이진 탐색 없이, 점프 시점 기준으로 (시작, 끝)을 수집합니다.
+
+        Returns:
+            list of (start_sec, end_sec): 대략적인 구간 리스트 (초 단위).
+            구간이 없으면 [].
+        """
+        start_time = time.time()
+        jump_frames = int(jump_sec * self.fps)
+        print(f"[전체 스캔] 점프 간격 {jump_sec}초, 해상도 1/{DETECT_SCALE}로 삼분할 판별합니다.")
+
+        segments = []  # (start_frame, end_frame) 또는 (start_sec, end_sec)
+        in_tri_split = False
+        segment_start_frame = 0
+        frame_idx = 0
+
+        while frame_idx < self.total_frames:
+            frame = self._get_frame_at_index(frame_idx)
+            is_tri = self._is_tri_split_at_frame(frame)
+
+            if not in_tri_split and is_tri:
+                # 일반 → 삼분할 전환: 구간 시작
+                segment_start_frame = frame_idx
+                in_tri_split = True
+            elif in_tri_split and not is_tri:
+                # 삼분할 → 일반 전환: 구간 끝
+                segment_end_frame = frame_idx
+                start_sec = segment_start_frame / self.fps
+                end_sec = segment_end_frame / self.fps
+                segments.append((start_sec, end_sec))
+                print(f"  구간 {len(segments)}: {format_time(start_sec)} ~ {format_time(end_sec)}")
+                in_tri_split = False
+
+            frame_idx += jump_frames
+
+        # 영상 끝까지 삼분할이면 마지막 구간 닫기
+        if in_tri_split:
+            segment_end_frame = min(frame_idx, self.total_frames - 1)
+            start_sec = segment_start_frame / self.fps
+            end_sec = segment_end_frame / self.fps
+            segments.append((start_sec, end_sec))
+            print(f"  구간 {len(segments)}: {format_time(start_sec)} ~ {format_time(end_sec)} (영상 끝)")
+
+        elapsed = time.time() - start_time
+        print(f"[전체 스캔] 완료: 구간 {len(segments)}개 (소요 {elapsed:.3f}초)")
+        return segments
+
     def find_first_tri_split(self):
         """
         영상을 30초 단위로 듬성듬성 스캔하다가 첫 번째 삼분할 화면을 발견하면
@@ -273,15 +338,20 @@ class SplitVideoDetector:
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("사용법: python tri_split_detector.py <비디오파일경로.ts>")
+        print("사용법: python tri_split_detector.py <비디오파일경로.ts> [--all-segments]")
+        print("  --all-segments : 전체 스캔(대략)으로 모든 삼분할 구간 목록 출력")
         sys.exit(1)
-        
+
     video_file = sys.argv[1]
-    
+    do_all_segments = len(sys.argv) >= 3 and sys.argv[2] == "--all-segments"
+
     print("ffprobe로 영상 정보 확인 중... (전체 인덱싱 없음, 즉시 시작)")
     init_start = time.time()
     detector = SplitVideoDetector(video_file)
     init_end = time.time()
     print(f"영상 정보 준비 완료 (소요 시간: {init_end - init_start:.3f}초)\n")
-    
-    detector.find_first_tri_split()
+
+    if do_all_segments:
+        detector.scan_all_segments_coarse()
+    else:
+        detector.find_first_tri_split()
