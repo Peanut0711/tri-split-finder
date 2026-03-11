@@ -11,3 +11,7 @@ numpy>=1.20
 # GPU 판정 연산 (--cuda 사용 시, NVIDIA CUDA 12.x)
 # pip install cupy-cuda12x
 # CUDA 11.x: cupy-cuda11x
+
+# --merge-notify toast 클릭 시 탐색기에서 파일 위치 열기 (Windows, Win11 25H2 등 호환)
+# pip install win11toast
+# 또는 pip install win10toast-click  (Win10 위주)

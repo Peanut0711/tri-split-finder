@@ -1114,28 +1114,74 @@ def _merge_segment_worker(args: tuple) -> tuple:
     return (idx, True, elapsed, first_kf, trim_end_kf, duration_cut, start - start_cut, cut_sec, trim_sec)
 
 
-def _start_background_copy(src: str, dst: str) -> None:
+def _merge_notify(mode: str, output_path: Path, n_segments: int) -> None:
     """
-    스테이징 파일(src)을 최종 경로(dst)로 복사한 뒤 src를 삭제하는 프로세스를 백그라운드로 기동.
-    부모 프로세스는 대기하지 않고 반환한다.
+    병합·복사 완료 시 알림. mode: 'print' | 'sound' | 'toast' | 'all'
+    - print: 콘솔 메시지(이미 출력된 후 호출되므로 추가 메시지만)
+    - sound: 비프음 (Windows winsound, 그 외 \\a 벨)
+    - toast: Windows 토스트. win11toast(권장, Win11/10) 또는 win10toast-click 있으면 클릭 시 탐색기에서 해당 파일 위치 열기, 없으면 plyer 사용(클릭 동작 없음)
     """
-    cmd = [
-        sys.executable, "-c",
-        "import shutil,sys; from pathlib import Path;"
-        " shutil.copy2(sys.argv[1], sys.argv[2]);"
-        " Path(sys.argv[1]).unlink(missing_ok=True)",
-        src, dst,
-    ]
-    kwargs = {
-        "stdin": subprocess.DEVNULL,
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
-    }
-    if os.name == "nt":
-        kwargs["creationflags"] = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
-    else:
-        kwargs["start_new_session"] = True
-    subprocess.Popen(cmd, **kwargs)
+    if not mode or mode == "print":
+        return  # print는 호출 전 이미 출력됨
+    if mode == "all":
+        _merge_notify("sound", output_path, n_segments)
+        _merge_notify("toast", output_path, n_segments)
+        return
+    if mode == "sound":
+        try:
+            if os.name == "nt":
+                import winsound
+                winsound.Beep(1000, 300)
+            else:
+                sys.stdout.write("\a")
+                sys.stdout.flush()
+        except Exception:
+            pass
+        return
+    if mode == "toast":
+        dest_str = str(output_path.resolve())
+        # Windows: 클릭 시 탐색기에서 해당 파일 선택해서 열기
+        def _open_in_explorer(_args: dict | None = None) -> None:
+            try:
+                if os.name == "nt":
+                    subprocess.Popen(["explorer", "/select", dest_str], shell=False)
+            except Exception:
+                pass
+        try:
+            if os.name == "nt":
+                # Windows 11/10 호환: win11toast 우선 (WinRT 기반, Win11 25H2 등에서 동작)
+                from win11toast import notify
+                notify(
+                    "삼분할 병합 완료",
+                    f"{output_path.name}  ({n_segments}개 구간)\n클릭 시 폴더에서 파일 위치 열기",
+                    on_click=_open_in_explorer,
+                )
+                return
+        except Exception:
+            pass
+        try:
+            if os.name == "nt":
+                from win10toast_click import ToastNotifier
+                toaster = ToastNotifier()
+                toaster.show_toast(
+                    "삼분할 병합 완료",
+                    f"{output_path.name}  ({n_segments}개 구간)\n클릭 시 폴더에서 파일 위치 열기",
+                    duration=5,
+                    threaded=True,
+                    callback_on_click=_open_in_explorer,
+                )
+                return
+        except Exception:
+            pass
+        try:
+            from plyer import notification
+            notification.notify(
+                title="삼분할 병합 완료",
+                message=f"{output_path.name}  ({n_segments}개 구간)",
+                timeout=5,
+            )
+        except Exception:
+            pass
 
 
 def _merge_output_path_for_input(input_path: Path) -> Path:
@@ -1157,6 +1203,7 @@ def merge_segments(
     output_path: Path,
     use_gpu: bool = False,
     merge_workers: int = 2,
+    merge_notify: str = "print",
 ) -> bool:
     """
     구간 목록을 ffmpeg로 코덱 카피(-c copy)해 잘라 concat demuxer로 이어붙여 output_path에 저장.
@@ -1274,16 +1321,45 @@ def merge_segments(
             print("[오류] 구간 합치기(concat) 실패", file=sys.stderr)
             return False
         print(f"  concat 합치기(로컬)  소요 {concat_elapsed:.1f}초", flush=True)
-        # 최종 경로가 로컬 임시와 다르면 복사. 비동기: 로컬 스테이징 후 백그라운드에서 최종 경로로 복사.
+        # 최종 경로가 로컬 임시와 다르면 블로킹 복사 후 검증·완료 알림
         if local_merged.resolve() != output_path.resolve():
-            staging_path = merge_base / f"merged_staging_{time.time_ns()}.mp4"
-            shutil.copy2(str(local_merged), str(staging_path))
-            _start_background_copy(str(staging_path), str(output_path.resolve()))
-            print(f"  최종 파일 복사 → 백그라운드 진행 중: {output_path}", flush=True)
-            print(f"병합 완료(로컬). 네트워크/최종 경로로 복사는 백그라운드에서 진행 중.  (총 {len(segments)}개 구간, 병합 소요 {time.perf_counter() - merge_start:.1f}초)", flush=True)
+            dest = output_path.resolve()
+            print(f"  최종 파일 복사 중... → {dest}", flush=True)
+            copy_start = time.perf_counter()
+            try:
+                # Windows UNC: copyfile만 쓰면 메타데이터(copystat) 오류 회피. 목적지 존재·크기 검증.
+                shutil.copyfile(str(local_merged), str(dest))
+                # 메타데이터는 복사 실패해도 파일은 있으면 성공으로 간주
+                try:
+                    shutil.copystat(str(local_merged), str(dest))
+                except OSError:
+                    pass
+            except OSError as e:
+                print(f"[오류] 최종 경로로 복사 실패: {dest}", file=sys.stderr)
+                print(f"  {e}", file=sys.stderr)
+                return False
+            copy_elapsed = time.perf_counter() - copy_start
+            # 복사 후 목적지 존재·크기 검증 (UNC 등에서 실제로 쓰이지 않는 경우 대비)
+            try:
+                if not dest.exists():
+                    print(f"[오류] 복사 후 목적지 파일이 없습니다: {dest}", file=sys.stderr)
+                    return False
+                src_size = local_merged.stat().st_size
+                dst_size = dest.stat().st_size
+                if dst_size != src_size:
+                    print(f"[오류] 복사 후 크기 불일치 (원본 {src_size}, 목적지 {dst_size}): {dest}", file=sys.stderr)
+                    return False
+            except OSError as e:
+                print(f"[오류] 복사 검증 실패: {e}", file=sys.stderr)
+                return False
+            total_elapsed = time.perf_counter() - merge_start
+            print(f"  복사 완료 (소요 {copy_elapsed:.1f}초)", flush=True)
+            print(f"병합 완료: {dest}  (총 {len(segments)}개 구간, 병합 총 소요 {total_elapsed:.1f}초)", flush=True)
+            _merge_notify(merge_notify, output_path, len(segments))
         else:
             total_elapsed = time.perf_counter() - merge_start
             print(f"병합 완료: {output_path}  (총 {len(segments)}개 구간, 병합 총 소요 {total_elapsed:.1f}초)", flush=True)
+            _merge_notify(merge_notify, output_path, len(segments))
         return True
     finally:
         try:
@@ -1397,6 +1473,14 @@ def main() -> None:
         help="병합 시 구간 추출 병렬 워커 수. 기본 2(네트워크/HDD 권장). 로컬 NVMe면 4~8 시도 가능. 예: --merge-workers 6",
     )
     parser.add_argument(
+        "--merge-notify",
+        type=str,
+        default="print",
+        choices=("print", "sound", "toast", "all"),
+        metavar="MODE",
+        help="병합·복사 완료 시 알림. print=콘솔만, sound=비프음, toast=Windows 토스트(win11toast 권장·Win11 호환, 클릭 시 폴더 열기; 없으면 win10toast-click→plyer), all=sound+toast. 기본 print",
+    )
+    parser.add_argument(
         "--segments-out",
         nargs="?",
         const=True,
@@ -1414,10 +1498,11 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # 실행 로그를 logs 폴더에 txt로 저장 (stdout/stderr 동시 기록)
-    log_dir = LOG_DIR
+    # 실행 로그를 logs 폴더 내 일별 하위 폴더에 txt로 저장 (stdout/stderr 동시 기록)
+    now = datetime.now()
+    log_dir = LOG_DIR / now.strftime("%Y-%m-%d")
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"tripartite_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    log_path = log_dir / f"tripartite_{now.strftime('%Y%m%d_%H%M%S')}.txt"
     log_file = open(log_path, "w", encoding="utf-8")
     # 로그 최상단에 실행한 CLI 명령 기록
     cmd_line = sys.executable + " " + " ".join(shlex.quote(arg) for arg in sys.argv)
@@ -1434,6 +1519,7 @@ def main() -> None:
         if not path.is_file():
             print(f"[오류] 파일을 찾을 수 없습니다: {path}", file=sys.stderr)
             sys.exit(1)
+        run_start_wall = time.perf_counter()
 
         use_gpu = getattr(args, "cuda", False)
         segments_in = getattr(args, "segments_in", None)
@@ -1475,8 +1561,9 @@ def main() -> None:
                 )
                 merge_workers = getattr(args, "merge_workers", 2)
                 print(f"구간 병합 중... (코덱 카피, merge-workers={merge_workers}) → {output_path}", flush=True)
-                if not merge_segments(path, segments, output_path, use_gpu, merge_workers=merge_workers):
+                if not merge_segments(path, segments, output_path, use_gpu, merge_workers=merge_workers, merge_notify=args.merge_notify):
                     sys.exit(1)
+                print(f"전체 실행(시작~완료): {_format_elapsed(time.perf_counter() - run_start_wall)}", flush=True)
             return
 
         print(f"입력: {path}")
@@ -1602,8 +1689,10 @@ def main() -> None:
             )
             merge_workers = getattr(args, "merge_workers", 2)
             print(f"구간 병합 중... (코덱 카피, merge-workers={merge_workers}) → {output_path}", flush=True)
-            if not merge_segments(path, segments, output_path, use_gpu, merge_workers=merge_workers):
+            if not merge_segments(path, segments, output_path, use_gpu, merge_workers=merge_workers, merge_notify=args.merge_notify):
                 sys.exit(1)
+            else:
+                print(f"전체 실행(시작~완료): {_format_elapsed(time.perf_counter() - run_start_wall)}", flush=True)
     finally:
         try:
             log_file.flush()
