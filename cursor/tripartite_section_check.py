@@ -1055,10 +1055,13 @@ def _seg_output_path_for_input(input_path: Path) -> Path:
 def _merge_segment_worker(args: tuple) -> tuple:
     """
     병렬용: 한 구간을 cut → 키프레임 탐색 → 앞/뒤 트림해 segment_xxxx.ts 생성.
-    args = (path_str, start, end, index_0based, tmpdir_str, use_gpu, leading_buffer_sec, trailing_buffer_sec, duration_sec)
+    args = (path_str, start, end, index_0based, tmpdir_str, use_gpu, leading_buffer_sec, trailing_buffer_sec, duration_sec, is_last_segment?)
+    is_last_segment=True면 끝을 '구간 끝 키프레임'이 아니라 '그 다음 키프레임'까지 포함 (삼분할이 끝난 뒤 조금 더 포함).
     반환: (index_0based, success, elapsed_sec, first_kf, last_kf, duration_cut, buffer_sec, cut_sec, trim_sec)
     """
-    path_str, start, end, idx, tmpdir_str, use_gpu, leading_sec, trailing_sec, duration_sec = args
+    n = len(args)
+    path_str, start, end, idx, tmpdir_str, use_gpu, leading_sec, trailing_sec, duration_sec = args[:9]
+    is_last_segment = bool(args[9]) if n > 9 else False
     t0 = time.perf_counter()
     tmpdir = Path(tmpdir_str)
     seg_path = tmpdir / f"segment_{idx + 1:04d}.ts"
@@ -1081,10 +1084,18 @@ def _merge_segment_worker(args: tuple) -> tuple:
         return (idx, False, time.perf_counter() - t0, None, None, None, cut_sec, None)
     keyframes = _get_keyframe_times_from_file(temp_seg)
     first_kf = keyframes[0] if keyframes else 0.0
-    # 종료 구간: 자른 조각 내에서 마지막 키프레임(구간 끝~끝+3초 사이)에서 끊기
+    # 종료 구간: 자른 조각 내에서 마지막 키프레임(구간 끝 이하)에서 끊기. 마지막 구간이면 그 다음 키프레임까지 포함.
     valid_end = [k for k in keyframes if k <= duration_cut]
     last_kf = max(valid_end) if valid_end else duration_cut
-    trim_dur = last_kf - first_kf
+    if is_last_segment and keyframes:
+        next_kfs = [k for k in keyframes if k > last_kf and k <= duration_cut]
+        if next_kfs:
+            trim_end_kf = min(next_kfs)
+        else:
+            trim_end_kf = last_kf
+    else:
+        trim_end_kf = last_kf
+    trim_dur = trim_end_kf - first_kf
     trim_sec = 0.0
     if trim_dur > 0.5:
         cmd_trim = [
@@ -1100,7 +1111,7 @@ def _merge_segment_worker(args: tuple) -> tuple:
     else:
         temp_seg.rename(seg_path)
     elapsed = time.perf_counter() - t0
-    return (idx, True, elapsed, first_kf, last_kf, duration_cut, start - start_cut, cut_sec, trim_sec)
+    return (idx, True, elapsed, first_kf, trim_end_kf, duration_cut, start - start_cut, cut_sec, trim_sec)
 
 
 def _start_background_copy(src: str, dst: str) -> None:
@@ -1154,6 +1165,7 @@ def merge_segments(
     """
     LEADING_BUFFER_SEC = 3.0   # 각 구간 자를 때 시작점 이전 3초까지 포함
     TRAILING_BUFFER_SEC = 3.0  # 각 구간 자를 때 종료점 이후 3초까지 포함 (끝 키프레임 탐색용)
+    TRAILING_BUFFER_LAST_SEC = 12.0  # 마지막 구간: 끝 다음 키프레임까지 포함하려면 버퍼를 더 둠
     if not segments:
         return False
     try:
@@ -1179,7 +1191,13 @@ def merge_segments(
         n_workers = max(1, merge_workers)
         if n_seg >= 2:
             worker_args = [
-                (path_str, start, end, i, str(tmpdir), use_gpu, LEADING_BUFFER_SEC, TRAILING_BUFFER_SEC, duration_sec)
+                (
+                    path_str, start, end, i, str(tmpdir), use_gpu,
+                    LEADING_BUFFER_SEC,
+                    TRAILING_BUFFER_LAST_SEC if i == n_seg - 1 else TRAILING_BUFFER_SEC,
+                    duration_sec,
+                    i == n_seg - 1,
+                )
                 for i, (start, end) in enumerate(segments)
             ]
             with ProcessPoolExecutor(max_workers=n_workers) as executor:
@@ -1194,13 +1212,14 @@ def merge_segments(
                 if first_kf is not None and first_kf > 0.01:
                     print(f"  구간 [{idx + 1}] 앞부분 트림: 첫 키프레임({first_kf:.2f}초)부터 사용 (앞 {first_kf:.1f}초 제거)", flush=True)
                 if last_kf is not None and duration_cut - last_kf > 0.01:
-                    print(f"  구간 [{idx + 1}] 뒷부분 트림: 마지막 키프레임({last_kf:.2f}초)까지 사용 (뒤 {duration_cut - last_kf:.1f}초 제거)", flush=True)
+                    end_desc = "다음 키프레임" if idx == n_seg - 1 else "마지막 키프레임"
+                    print(f"  구간 [{idx + 1}] 뒷부분 트림: {end_desc}({last_kf:.2f}초)까지 사용 (뒤 {duration_cut - last_kf:.1f}초 제거)", flush=True)
         else:
             (start, end) = segments[0]
             seg_path = tmpdir / "segment_0001.ts"
             temp_seg = tmpdir / "segment_0001_temp.ts"
             start_cut = max(0.0, start - LEADING_BUFFER_SEC)
-            end_cut = min(duration_sec, end + TRAILING_BUFFER_SEC)
+            end_cut = min(duration_sec, end + TRAILING_BUFFER_LAST_SEC)  # 단일 구간 = 마지막 구간, 다음 키프레임까지 포함하려 버퍼 확대
             duration_cut = end_cut - start_cut
             cmd_cut = ["ffmpeg", "-y"]
             if use_gpu:
@@ -1219,7 +1238,9 @@ def merge_segments(
             first_kf = keyframes[0] if keyframes else 0.0
             valid_end = [k for k in keyframes if k <= duration_cut]
             last_kf = max(valid_end) if valid_end else duration_cut
-            trim_dur = last_kf - first_kf
+            next_kfs = [k for k in keyframes if k > last_kf and k <= duration_cut] if keyframes else []
+            trim_end_kf = min(next_kfs) if next_kfs else last_kf
+            trim_dur = trim_end_kf - first_kf
             if trim_dur > 0.5:
                 cmd_trim = [
                     "ffmpeg", "-y", "-ss", str(first_kf), "-i", str(temp_seg),
@@ -1232,8 +1253,8 @@ def merge_segments(
                     return False
                 if first_kf > 0.01:
                     print(f"  구간 [1] 앞부분 트림: 첫 키프레임({first_kf:.2f}초)부터 사용 (앞 {first_kf:.1f}초 제거)", flush=True)
-                if duration_cut - last_kf > 0.01:
-                    print(f"  구간 [1] 뒷부분 트림: 마지막 키프레임({last_kf:.2f}초)까지 사용 (뒤 {duration_cut - last_kf:.1f}초 제거)", flush=True)
+                if duration_cut - trim_end_kf > 0.01:
+                    print(f"  구간 [1] 뒷부분 트림: 마지막 구간이므로 다음 키프레임({trim_end_kf:.2f}초)까지 사용 (뒤 {duration_cut - trim_end_kf:.1f}초 제거)", flush=True)
             else:
                 temp_seg.rename(seg_path)
         with open(list_path, "w", encoding="utf-8") as f:
@@ -1452,8 +1473,9 @@ def main() -> None:
                     if args.merge is not True
                     else _merge_output_path_for_input(path)
                 )
-                print(f"구간 병합 중... (코덱 카피) → {output_path}", flush=True)
-                if not merge_segments(path, segments, output_path, use_gpu, merge_workers=args.merge_workers):
+                merge_workers = getattr(args, "merge_workers", 2)
+                print(f"구간 병합 중... (코덱 카피, merge-workers={merge_workers}) → {output_path}", flush=True)
+                if not merge_segments(path, segments, output_path, use_gpu, merge_workers=merge_workers):
                     sys.exit(1)
             return
 
@@ -1578,8 +1600,9 @@ def main() -> None:
                 if args.merge is not True
                 else _merge_output_path_for_input(path)
             )
-            print(f"구간 병합 중... (코덱 카피) → {output_path}", flush=True)
-            if not merge_segments(path, segments, output_path, use_gpu, merge_workers=args.merge_workers):
+            merge_workers = getattr(args, "merge_workers", 2)
+            print(f"구간 병합 중... (코덱 카피, merge-workers={merge_workers}) → {output_path}", flush=True)
+            if not merge_segments(path, segments, output_path, use_gpu, merge_workers=merge_workers):
                 sys.exit(1)
     finally:
         try:
