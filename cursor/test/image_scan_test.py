@@ -206,7 +206,7 @@ def test_tripartite_image(
 # --- 실행 부분 ---
 # 테스트하실 이미지의 실제 경로로 수정해주세요.
 # 한글 경로: raw 문자열(r"...") 또는 슬래시 사용. OpenCV는 Windows에서 유니코드 경로를 _imread_unicode로 처리.
-test_image_path = r"image\[2025-02-14] 고라니율 해피발렌타인~! 1080p60 (2).ts_20260312_001846.802.jpg"  # 업로드 하신 이미지 파일명 또는 경로
+test_image_path = r"image\input_8.jpg"  # 업로드 하신 이미지 파일명 또는 경로
 
 # 함수 실행 (UI 있는 삼분할은 기본값으로 일치도 향상 적용됨)
 test_tripartite_image(

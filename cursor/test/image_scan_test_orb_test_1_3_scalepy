@@ -1,13 +1,12 @@
 """
-삼분할 영상 판별 (ORB 특징점 매칭) — 1/4 해상도 버전
+삼분할 영상 판별 (ORB 특징점 매칭) — 1/3 해상도 버전
 
-이미지를 1/4로 축소한 뒤 판별하여 연산 부하를 줄입니다. (image_scan_test_orb_scale.py 참고)
+이미지를 1/3로 축소한 뒤 판별하여 연산 부하를 줄입니다.
 
 동작 방식:
   1) 중앙 기준 비교: 중앙(C) vs 좌(L), 중앙(C) vs 우(R) 로 매칭하여 삼분할 여부 판별.
   2) 실패 시 폴백: 위 판별이 부족하면 좌(L) vs 우(R) 직접 비교.
-     - 좌·우가 동일 복사본이면 (x,y) 일치; 거울 대칭이면 x_l ≈ (slice_w-1 - x_r) 허용.
-     - 중앙만 줌/이펙트·좌우 거울 배치인 경우에도 삼분할로 인정 가능.
+     - 좌·우가 동일 소스 복사본이면 로컬 좌표 (x,y)가 거의 일치하므로, L==R 일치점이 많으면 삼분할로 인정.
 """
 
 import argparse
@@ -15,22 +14,22 @@ import time
 import cv2
 import numpy as np
 
-def test_tripartite_orb_v2(image_path, tol=4, min_matches=15):
+def test_tripartite_orb_v2(image_path, tol=5, min_matches=15):
     """
     ORB 특징점 매칭을 이용해 삼분할 영상 여부를 판별합니다.
-    (v2: ROI, 1/4 해상도·nfeatures 1000, 비대칭 판별)
+    (v2: ROI, 1/3 해상도·nfeatures 1500, 비대칭 판별)
     
     :param image_path: 테스트할 이미지 경로
-    :param tol: 좌우 매칭 시 허용할 픽셀 위치 오차 (1/4 해상도 기준, 기본 4)
-    :param min_matches: 좌/우 각각 최소 일치 특징점 개수 (1/4 해상도 기준, 기본 15)
+    :param tol: 좌우 매칭 시 허용할 픽셀 위치 오차 (1/3 해상도 기준, 기본 5)
+    :param min_matches: 좌/우 각각 최소 일치 특징점 개수 (1/3 해상도 기준, 기본 15)
     """
     img_raw = cv2.imread(image_path)
     if img_raw is None:
         print(f"Error: '{image_path}' 이미지를 불러올 수 없습니다.")
         return
 
-    # [1/4 해상도] 부하 감소를 위해 축소 후 판별 (image_scan_test_orb_scale.py 참고)
-    img = cv2.resize(img_raw, (0, 0), fx=0.25, fy=0.25, interpolation=cv2.INTER_AREA)
+    # [1/3 해상도] 부하 감소를 위해 축소 후 판별
+    img = cv2.resize(img_raw, (0, 0), fx=1/3.0, fy=1/3.0, interpolation=cv2.INTER_AREA)
 
     t_start = time.perf_counter()
     h, w = img.shape[:2]
@@ -42,7 +41,7 @@ def test_tripartite_orb_v2(image_path, tol=4, min_matches=15):
     center_img = img[:roi_h, slice_w:slice_w*2]
     right_img = img[:roi_h, slice_w*2:]
 
-    # [1/4 해상도] 특징점 수 비례 축소 (5000 → 1000). 저해상도에서는 과한 개수 불필요·연산 낭비
+    # [1/3 해상도] 특징점 수 비례 (1/4보다 해상도 높음 → 1000)
     orb = cv2.ORB_create(nfeatures=1000)
 
     kp_l, des_l = orb.detectAndCompute(left_img, None)
@@ -71,21 +70,17 @@ def test_tripartite_orb_v2(image_path, tol=4, min_matches=15):
     valid_lr = []
     # [Fallback] 중앙 기준 매칭 실패 시 → 좌/우 직접 비교 (L vs R)
     # (중앙만 줌/이펙트가 있고 좌·우가 동일 소스인 경우 대응)
-    # + 좌·우가 거울 대칭(mirror)인 경우: x_l ≈ (slice_w-1 - x_r), y 동일
     if not is_tripartite and des_l is not None and des_r is not None:
         print("  [알림] 중앙 기준 매칭 부족 -> 좌/우 직접 비교(L vs R) 시작")
         matches_lr = bf.match(des_l, des_r)
         for m in matches_lr:
             pt_l = kp_l[m.queryIdx].pt
             pt_r = kp_r[m.trainIdx].pt
-            # 동일 복사본: (x,y) 거의 같음
-            same = abs(pt_l[0] - pt_r[0]) <= tol and abs(pt_l[1] - pt_r[1]) <= tol
-            # 거울 대칭: x_l ≈ (slice_w-1 - x_r), y 같음
-            mirror = abs(pt_l[0] - (slice_w - 1 - pt_r[0])) <= tol and abs(pt_l[1] - pt_r[1]) <= tol
-            if same or mirror:
+            # 좌·우는 복사본이므로 로컬 좌표 (x,y)가 거의 같아야 함
+            if abs(pt_l[0] - pt_r[0]) <= tol and abs(pt_l[1] - pt_r[1]) <= tol:
                 valid_lr.append(m)
         cnt_lr = len(valid_lr)
-        print(f"  [결과] 좌/우 직접 일치점: {cnt_lr}개 (동일+거울 허용)")
+        print(f"  [결과] 좌/우 직접 일치점: {cnt_lr}개")
         if cnt_lr >= min_matches:
             is_tripartite = True
             print("  [확정] ✅ 좌/우 일치 확인으로 삼분할 판정!")
@@ -135,12 +130,12 @@ def test_tripartite_orb_v2(image_path, tol=4, min_matches=15):
 
 # --- 실행 부분 ---
 def main():
-    parser = argparse.ArgumentParser(description="ORB 삼분할 판별 (1/4 해상도, 중앙 기준 + L vs R 폴백)")
+    parser = argparse.ArgumentParser(description="ORB 삼분할 판별 (1/3 해상도, 중앙 기준 + L vs R 폴백)")
     parser.add_argument("image_path", help="판별할 이미지 파일 경로")
-    parser.add_argument("--tol", type=int, default=4,
-                        help="픽셀 오차 허용치, 1/4 해상도 기준 (기본: 4)")
+    parser.add_argument("--tol", type=int, default=5,
+                        help="픽셀 오차 허용치, 1/3 해상도 기준 (기본: 5)")
     parser.add_argument("--min-matches", type=int, default=15, dest="min_matches",
-                        help="최소 일치 특징점 개수, 1/4 해상도 기준 (기본: 15)")
+                        help="최소 일치 특징점 개수, 1/3 해상도 기준 (기본: 15)")
     args = parser.parse_args()
 
     test_tripartite_orb_v2(
