@@ -102,12 +102,41 @@ def fast_edge_check_bipartite(frame_gray, search_range=15, threshold_mult=5.0):
     return is_bipartite, peak_idx
 
 
-def run_edge_check(image_path, search_range=15, threshold_mult=5.0):
+def resize_with_preset(img, preset: str):
+    """
+    FHD(1920x1080) 기준 테스트용 다운스케일 프리셋.
+    - "orig" : 원본 그대로
+    - "640"  : 가로 640, 세로는 종횡비 유지 (예: 1920x1080 → 640x360)
+    - "480"  : 가로 480, 세로는 종횡비 유지 (예: 1920x1080 → 480x270)
+    """
+    if preset == "orig":
+        return img
+
+    try:
+        target_width = int(preset)
+    except ValueError:
+        print(f"[경고] 지원하지 않는 프리셋입니다: {preset} (orig, 640, 480 중 선택)")
+        return img
+
+    h, w = img.shape[:2]
+    if w == 0 or h == 0:
+        return img
+
+    scale = target_width / w
+    target_height = max(1, int(h * scale))
+
+    return cv2.resize(img, (target_width, target_height))
+
+
+def run_edge_check(image_path, search_range=15, threshold_mult=5.0, preset="orig"):
     """삼분할(w/3, 2w/3) → 불만족 시 이분할(중앙) 검사. 경계선 위치 출력 + debug/*_debug_edge.jpg 저장."""
     img = cv2.imread(image_path)
     if img is None:
         print(f"[오류] 이미지를 불러올 수 없습니다: {image_path}")
         return
+
+    # FHD(1920x1080) 기준 프리셋 다운스케일 적용 (종횡비 유지)
+    img = resize_with_preset(img, preset)
 
     frame_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
@@ -149,13 +178,13 @@ def run_edge_check(image_path, search_range=15, threshold_mult=5.0):
         cv2.line(debug_img, (p_r, 0), (p_r, h), line_color, 3)
         cv2.putText(debug_img, f"Peak R: {p_r}px", (p_r + 10, 50),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, line_color, 2)
-        status_text = f"Status: OK (삼분할) | Gap: {p_r - p_l}px"
+        status_text = f"Status: OK (3-split) | Gap: {p_r - p_l}px"
     elif is_bi:
         line_color = (0, 255, 0)
         cv2.line(debug_img, (p_center, 0), (p_center, h), line_color, 3)
         cv2.putText(debug_img, f"Center: {p_center}px", (p_center + 10, 50),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, line_color, 2)
-        status_text = f"Status: OK (이분할) | Center: {p_center}px"
+        status_text = f"Status: OK (2-split) | Center: {p_center}px"
     else:
         line_color = (0, 0, 255)
         cv2.line(debug_img, (p_l, 0), (p_l, h), line_color, 3)
@@ -169,12 +198,13 @@ def run_edge_check(image_path, search_range=15, threshold_mult=5.0):
     cv2.putText(debug_img, status_text, (50, h - 50),
                 cv2.FONT_HERSHEY_SIMPLEX, 1.2, line_color, 3)
 
-    # 저장: 이미지가 있는 폴더 안 debug/ 에 *_debug_edge.jpg 로 저장
+    # 저장: 이미지가 있는 폴더 안 debug/ 에 *_debug_edge.jpg 로 저장 (축소 시 파일명에 프리셋 포함)
     img_dir = os.path.dirname(os.path.abspath(image_path))
     debug_dir = os.path.join(img_dir, "debug")
     os.makedirs(debug_dir, exist_ok=True)
     base_name = os.path.splitext(os.path.basename(image_path))[0]
-    out_path = os.path.join(debug_dir, base_name + "_debug_edge.jpg")
+    suffix = f"_{preset}_debug_edge.jpg" if preset != "orig" else "_debug_edge.jpg"
+    out_path = os.path.join(debug_dir, base_name + suffix)
     cv2.imwrite(out_path, debug_img)
     if is_tri:
         print(f"📍 경계선 좌표 확인 완료: {p_l}px, {p_r}px (저장: {out_path})")
@@ -189,12 +219,19 @@ def main():
     parser.add_argument("image_path", help="판별할 이미지 파일 경로 (예: image.jpg)")
     parser.add_argument("--threshold", type=float, default=5.0, help="로컬 참조 대비 엣지 기준 배수 (기본: 5.0)")
     parser.add_argument("--search-range", type=int, default=15, help="1/3·2/3 지점 및 중앙 주변 검색 범위 픽셀 (기본: 15)")
+    parser.add_argument(
+        "--preset",
+        choices=["orig", "640", "480"],
+        default="orig",
+        help="입력 FHD 영상을 다운스케일할 가로 해상도 프리셋 (orig, 640, 480)",
+    )
     args = parser.parse_args()
 
     run_edge_check(
         args.image_path,
         search_range=args.search_range,
         threshold_mult=args.threshold,
+        preset=args.preset,
     )
 
 

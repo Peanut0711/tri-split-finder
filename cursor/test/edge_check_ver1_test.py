@@ -149,13 +149,13 @@ def run_edge_check(image_path, search_range=15, threshold_mult=5.0):
         cv2.line(debug_img, (p_r, 0), (p_r, h), line_color, 3)
         cv2.putText(debug_img, f"Peak R: {p_r}px", (p_r + 10, 50),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, line_color, 2)
-        status_text = f"Status: OK (삼분할) | Gap: {p_r - p_l}px"
+        status_text = f"Status: OK (3-split) | Gap: {p_r - p_l}px"
     elif is_bi:
         line_color = (0, 255, 0)
         cv2.line(debug_img, (p_center, 0), (p_center, h), line_color, 3)
         cv2.putText(debug_img, f"Center: {p_center}px", (p_center + 10, 50),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, line_color, 2)
-        status_text = f"Status: OK (이분할) | Center: {p_center}px"
+        status_text = f"Status: OK (2-split) | Center: {p_center}px"
     else:
         line_color = (0, 0, 255)
         cv2.line(debug_img, (p_l, 0), (p_l, h), line_color, 3)
