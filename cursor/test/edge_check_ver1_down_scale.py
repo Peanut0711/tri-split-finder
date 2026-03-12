@@ -12,11 +12,11 @@ import cv2
 import numpy as np
 
 
-def fast_edge_check_v3(frame_gray, search_range=15, threshold_mult=5.0):
+def fast_edge_check_v3(frame_gray, search_range=40, threshold_mult=5.0):
     """
     w*1/3, w*2/3 부근 피크 검색 + 간격 조건으로 삼분할 판정.
     :param frame_gray: 그레이스케일 이미지 (H, W)
-    :param search_range: 1/3, 2/3 지점 주변 검색 범위(픽셀).
+    :param search_range: 1/3, 2/3 지점 주변 검색 범위(픽셀). FHD에서 666/1311 수준까지 검사하려면 40 이상.
     :param threshold_mult: 로컬 참조 대비 이 배수 이상이면 엣지 있음으로 간주.
     :return: (is_tripartite, peak_l_idx, peak_r_idx)
     """
@@ -68,7 +68,7 @@ def fast_edge_check_v3(frame_gray, search_range=15, threshold_mult=5.0):
     return is_tripartite, peak_l_idx, peak_r_idx
 
 
-def fast_edge_check_bipartite(frame_gray, search_range=15, threshold_mult=5.0):
+def fast_edge_check_bipartite(frame_gray, search_range=40, threshold_mult=5.0):
     """
     화면 절반 지점(이분할) 경계선 검출.
     좌측 절반을 우측에 복사·붙여넣기한 영상에서 중앙(960 부근)의 수직 경계선을 찾음.
@@ -128,7 +128,7 @@ def resize_with_preset(img, preset: str):
     return cv2.resize(img, (target_width, target_height))
 
 
-def run_edge_check(image_path, search_range=15, threshold_mult=5.0, preset="orig"):
+def run_edge_check(image_path, search_range=40, threshold_mult=5.0, preset="orig"):
     """삼분할(w/3, 2w/3) → 불만족 시 이분할(중앙) 검사. 경계선 위치 출력 + debug/*_debug_edge.jpg 저장."""
     img = cv2.imread(image_path)
     if img is None:
@@ -140,16 +140,23 @@ def run_edge_check(image_path, search_range=15, threshold_mult=5.0, preset="orig
 
     frame_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
+    # 다운스케일 시 리사이즈 보간으로 경계가 흐려져 엣지 강도가 약해짐 → 기준 완화
+    effective_threshold = threshold_mult
+    if preset == "640":
+        effective_threshold = min(threshold_mult, 4.0)
+    elif preset == "480":
+        effective_threshold = min(threshold_mult, 3.5)
+
     # 1. 삼분할(640/1280) 엣지 체크 + 소요 시간 측정
     t0 = time.perf_counter()
-    is_tri, p_l, p_r = fast_edge_check_v3(frame_gray, search_range, threshold_mult)
+    is_tri, p_l, p_r = fast_edge_check_v3(frame_gray, search_range, effective_threshold)
     elapsed_ms = (time.perf_counter() - t0) * 1000
 
     # 2. 삼분할 불만족 시 → 화면 절반(이분할) 경계선 체크
     is_bi, p_center = False, 0
     if not is_tri:
         t_bi = time.perf_counter()
-        is_bi, p_center = fast_edge_check_bipartite(frame_gray, search_range, threshold_mult)
+        is_bi, p_center = fast_edge_check_bipartite(frame_gray, search_range, effective_threshold)
         elapsed_ms += (time.perf_counter() - t_bi) * 1000
 
     # 3. 경계선 검출 위치 및 엣지 검출 시간 출력
@@ -218,7 +225,7 @@ def main():
     parser = argparse.ArgumentParser(description="삼분할/이분할 영상 엣지 검출 (v3)")
     parser.add_argument("image_path", help="판별할 이미지 파일 경로 (예: image.jpg)")
     parser.add_argument("--threshold", type=float, default=5.0, help="로컬 참조 대비 엣지 기준 배수 (기본: 5.0)")
-    parser.add_argument("--search-range", type=int, default=15, help="1/3·2/3 지점 및 중앙 주변 검색 범위 픽셀 (기본: 15)")
+    parser.add_argument("--search-range", type=int, default=40, help="1/3·2/3 지점 주변 검색 범위 픽셀 (기본: 40, FHD에서 666/1311 수준까지 검사)")
     parser.add_argument(
         "--preset",
         choices=["orig", "640", "480"],
