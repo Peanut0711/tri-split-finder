@@ -47,6 +47,7 @@ python tripartite_section_check.py <input> [옵션...]
 | `--merge` | - | - | 검출된 구간만 코덱 카피로 잘라 한 파일로 이어붙여 저장. **인자 없으면** 원본과 같은 폴더에 **원본파일명_merged.mp4** 로 저장. |
 | `--merge OUTPUT` | - | - | 위와 동일하되, **OUTPUT**에 절대경로·파일명을 주면 그 위치에 저장. 예: `--merge "F:\세경\result.mp4"` |
 | `--merge-workers N` | int | 2 | 병합 시 구간 추출 병렬 워커 수. 네트워크/HDD 원본이면 2 권장. **로컬 NVMe** 원본이면 4~8 시도 가능. 예: `--merge-workers 6` |
+| `--merge-notify MODE` | 선택 | print | 병합·복사 완료 시 알림 방식. `print`=콘솔만, `sound`=비프음, `toast`=Windows 토스트(win11toast 권장·Win11 호환, 클릭 시 폴더 열기; 없으면 win10toast-click→plyer), `all`=sound+toast. 예: `--merge-notify toast` |
 
 ### 구간 목록 파일 (원하는 구간만 편집 후 병합)
 
@@ -84,6 +85,35 @@ python tripartite_section_check.py <input> [옵션...]
 
 ---
 
+## 네트워크 HDD / NAS 환경 추천 옵션
+
+홈 네트워크의 다른 PC에 연결된 HDD(예: `\\192.168.x.x\share\video.ts`)를 스캔할 때는 **디스크·네트워크가 병목**이 되기 쉽습니다.  
+아래 조합을 기본으로 쓰는 것을 권장합니다.
+
+- **부하 최소 + 안정성 위주**
+  - `--workers 1`
+  - `--coarse-scale 640`
+  - `--coarse-interval 30` (또는 45~60)
+  - `--merge-workers 1`
+  - 설명:
+    - `--workers 1`: 코스 스캔을 순차 처리해 **동시 읽기 1회**만 발생 → 네트워크/HDD 100% 부하 완화.
+    - `--coarse-scale 640`: 코스 스캔을 저해상도로만 디코딩 → 프레임당 처리량과 디코딩 부하 감소.
+    - `--coarse-interval`: 30초는 기본값, **60초 이상**으로 키우면 읽기 횟수가 줄어들어 더 가볍지만, 탐색이 성김.
+    - `--merge-workers 1`: 병합 단계에서도 동시 접근 1개만 유지.
+
+- **속도·부하 균형**
+  - `--workers 1`
+  - `--coarse-scale 960`
+  - `--coarse-interval 30`
+  - `--merge-workers 1` 또는 `2`
+
+> 참고: 동일 네트워크 HDD에서의 실험 로그 기준으로,  
+> `--workers 2`나 `--cuda`를 켰을 때 **총 실행 시간은 오히려 늘고**, 검출 결과는 동일했습니다.  
+> 이 환경에서는 **I/O(네트워크/HDD)가 병목**이라, 디코딩을 GPU로 옮겨도 시간 단축 효과가 거의 없고,  
+> 동시 접근 수를 줄이는 것이 더 중요합니다.
+
+---
+
 ## 실행 예시
 
 ```bash
@@ -107,6 +137,9 @@ python tripartite_section_check.py "F:\세경\video.ts" --cuda --merge
 
 # 병합 결과를 지정 경로/파일명으로 저장
 python tripartite_section_check.py "F:\세경\video.ts" --cuda --merge "F:\세경\result.mp4"
+
+# 병합 완료 시 Windows 토스트 알림 (클릭 시 폴더 열기)
+python tripartite_section_check.py "F:\세경\video.ts" --merge --merge-notify toast
 
 # 구간 목록 저장: 인자 없으면 같은 폴더에 video_seg.txt 생성
 python tripartite_section_check.py "F:\세경\video.ts" --cuda --segments-out
