@@ -106,6 +106,7 @@ def resize_with_preset(img, preset: str):
     """
     FHD(1920x1080) 기준 테스트용 다운스케일 프리셋.
     - "orig" : 원본 그대로
+    - "960"  : 가로 960, 세로는 종횡비 유지 (예: 1920x1080 → 960x540)
     - "640"  : 가로 640, 세로는 종횡비 유지 (예: 1920x1080 → 640x360)
     - "480"  : 가로 480, 세로는 종횡비 유지 (예: 1920x1080 → 480x270)
     """
@@ -115,7 +116,7 @@ def resize_with_preset(img, preset: str):
     try:
         target_width = int(preset)
     except ValueError:
-        print(f"[경고] 지원하지 않는 프리셋입니다: {preset} (orig, 640, 480 중 선택)")
+        print(f"[경고] 지원하지 않는 프리셋입니다: {preset} (orig, 960, 640, 480 중 선택)")
         return img
 
     h, w = img.shape[:2]
@@ -142,7 +143,9 @@ def run_edge_check(image_path, search_range=40, threshold_mult=5.0, preset="orig
 
     # 다운스케일 시 리사이즈 보간으로 경계가 흐려져 엣지 강도가 약해짐 → 기준 완화
     effective_threshold = threshold_mult
-    if preset == "640":
+    if preset == "960":
+        effective_threshold = min(threshold_mult, 4.5)
+    elif preset == "640":
         effective_threshold = min(threshold_mult, 4.0)
     elif preset == "480":
         effective_threshold = min(threshold_mult, 3.5)
@@ -228,9 +231,9 @@ def main():
     parser.add_argument("--search-range", type=int, default=40, help="1/3·2/3 지점 주변 검색 범위 픽셀 (기본: 40, FHD에서 666/1311 수준까지 검사)")
     parser.add_argument(
         "--preset",
-        choices=["orig", "640", "480"],
+        choices=["orig", "960", "640", "480"],
         default="orig",
-        help="입력 FHD 영상을 다운스케일할 가로 해상도 프리셋 (orig, 640, 480)",
+        help="입력 FHD 영상을 다운스케일할 가로 해상도 프리셋 (orig, 960, 640, 480)",
     )
     args = parser.parse_args()
 
