@@ -201,16 +201,17 @@ def verify_left_right_duplicate(
 ):
     """
     좌측 절반과 우측 절반이 동일(또는 매우 유사)한 영상인지 검증.
-    - 좌반 [0:center] 와 우반 [center:w] 가 대응 열끼리 비슷해야 함.
-    - 방법 1: 전체 절반 픽셀 비교 (use_half_compare=True)
-    - 방법 2: 상/중/하 + 좌반 내 x 2 위치에서 50x50 패치 비교 (FHD 기준 270, 810 부근)
-    둘 중 하나라도 기준을 만족하면 '동일 영상 좌우 복붙'으로 판단.
+    이분할 판정은 '중앙선 + 좌우 전체 일치'만 허용: 전체 좌반 vs 우반(half_compare) 유사도가
+    기준 이상일 때만 통과. 일부 패치만 비슷한 경우(우연한 오탐)는 통과시키지 않음.
+
+    - 필수: 전체 절반 픽셀 비교 (좌반 [0:center] vs 우반 [center:center+half_w]) 유사도 >= threshold
+    - 패치(상·중·하)는 실패 시 로그용 best_patch만 계산, 통과 조건으로는 사용하지 않음
 
     :param frame_gray: 그레이스케일 (H, W)
     :param center: 중앙 x (우반 시작 열 인덱스)
-    :param patch_size: 패치 한 변 길이
+    :param patch_size: 패치 한 변 길이 (실패 시 detail 로그용)
     :param similarity_threshold: 이 값 이상이면 유사로 인정 (0~1)
-    :param use_half_compare: True면 전체 좌/우 절반 유사도도 계산
+    :param use_half_compare: True면 전체 좌/우 절반 유사도로 통과 판단
     :return: (is_duplicate, detail_str)
     """
     h, w = frame_gray.shape
@@ -221,43 +222,38 @@ def verify_left_right_duplicate(
     left = frame_gray[:, 0:half_w]
     right = frame_gray[:, center : center + half_w]
 
-    # ----- 방법 1: 전체 절반 유사도 -----
+    half_sim_for_detail = 0.0
+    # ----- 필수: 전체 좌반 vs 우반 유사도 (이 조건만 통과 시 이분할 인정) -----
     if use_half_compare and left.size > 0 and right.size == left.size:
         half_sim = _patch_similarity(left, right)
+        half_sim_for_detail = half_sim
         if half_sim >= similarity_threshold:
             return True, f"half_compare sim={half_sim:.3f}"
 
-    # ----- 방법 2: 패치 샘플 (상/중/하 × 좌반 내 x 2 위치) -----
-    # FHD 기준 x 270, 810 부근 → center 기준으로 center/4, 3*center/4
+    # ----- 패치 유사도는 통과 조건 아님, 실패 시 로그(detail)용 -----
     patch_x_offsets = [center // 4, (3 * center) // 4]
     y_offsets = [h // 4, h // 2, (3 * h) // 4]
-
     ps = min(patch_size, half_w // 2, h // 2, 20)
-    if ps < 10:
-        return False, "image too small for patches"
-
     best_sim = 0.0
-    for x_off in patch_x_offsets:
-        for y_off in y_offsets:
-            y0 = max(0, y_off - ps // 2)
-            y1 = min(h, y0 + ps)
-            x0_l = max(0, x_off - ps // 2)
-            x1_l = min(center, x0_l + ps)
-            width = x1_l - x0_l
-            x0_r = center + x0_l
-            if x0_r + width > w or width <= 0:
-                continue
-            pl = frame_gray[y0:y1, x0_l:x1_l]
-            pr = frame_gray[y0:y1, x0_r:x0_r + width]
-            if pl.size == 0 or pr.size != pl.size:
-                continue
-            sim = _patch_similarity(pl, pr)
-            if sim >= similarity_threshold:
-                return True, f"patch sim={sim:.3f} at x_off={x_off} y_off={y_off}"
-            best_sim = max(best_sim, sim)
+    if ps >= 10:
+        for x_off in patch_x_offsets:
+            for y_off in y_offsets:
+                y0 = max(0, y_off - ps // 2)
+                y1 = min(h, y0 + ps)
+                x0_l = max(0, x_off - ps // 2)
+                x1_l = min(center, x0_l + ps)
+                width = x1_l - x0_l
+                x0_r = center + x0_l
+                if x0_r + width > w or width <= 0:
+                    continue
+                pl = frame_gray[y0:y1, x0_l:x1_l]
+                pr = frame_gray[y0:y1, x0_r:x0_r + width]
+                if pl.size == 0 or pr.size != pl.size:
+                    continue
+                sim = _patch_similarity(pl, pr)
+                best_sim = max(best_sim, sim)
 
-    half_sim = _patch_similarity(left, right) if use_half_compare and left.size == right.size else 0.0
-    detail = f"best_patch={best_sim:.3f}, half={half_sim:.3f}"
+    detail = f"best_patch={best_sim:.3f}, half={half_sim_for_detail:.3f} (필수: half>={similarity_threshold})"
     return False, detail
 
 
@@ -301,6 +297,7 @@ def fast_edge_check_bipartite(
 
     has_center_edge = peak_val > local_ref
     is_bipartite = has_center_edge
+    detail_success = None  # 검증 통과 시 원인 분석용 (half_compare / patch row=N)
 
     if has_center_edge and verify_duplicate:
         is_dup, detail = verify_left_right_duplicate(
@@ -311,10 +308,15 @@ def fast_edge_check_bipartite(
         is_bipartite = is_dup
         if has_center_edge and not is_dup:
             print(f"⚠️ 중앙 경계선은 있으나 좌/우 동일 영상 아님 (유사도 검증 실패: {detail}) → 이분할 미판정")
+        else:
+            detail_success = detail
 
     if is_bipartite:
         ts_str = f" 시각 {_format_time_sec(time_sec)}" if time_sec is not None else ""
-        print(f"🎯 이분할 경계선 탐지 성공! 위치: {peak_idx}px (중앙 {center} 부근){ts_str}")
+        msg = f"🎯 이분할 경계선 탐지 성공! 위치: {peak_idx}px (중앙 {center} 부근){ts_str}"
+        if detail_success is not None:
+            msg += f"  (검증: {detail_success})"
+        print(msg)
 
     return is_bipartite, peak_idx
 
