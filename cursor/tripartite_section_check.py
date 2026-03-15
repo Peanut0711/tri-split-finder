@@ -419,6 +419,60 @@ def get_tripartite_mse(
     )
 
 
+# ========== Edge-based fallback (선택 사항) ==========
+# --edge-fallback 시 처리 순서: 삼분할(MSE) → 실패 시 신규 삼분할(엣지) → 실패 시 이분할(엣지).
+# 이분할까지 감지되면 해당 시점도 구간에 포함되며, 인접 시 삼분할 구간과 하나로 합쳐짐(검출된 구간).
+# 제거 시: 아래 함수 삭제, _coarse_worker/순차 분기/_check_tripartite_at 내 fallback 호출 제거,
+# find_segments·_boundary_worker·main 의 use_edge_fallback 관련 인자/CLI 제거.
+def _edge_fallback_detect(
+    frame_bgr: np.ndarray,
+    scale_width: int,
+    search_range: int = 40,
+    time_sec: float | None = None,
+) -> tuple[bool, bool]:
+    """
+    엣지 기반 삼분할 → 이분할 순서로 판정 (test/edge_check_ver1_down_scale 알고리즘).
+    호출 조건: 메인(MSE) 삼분할이 실패한 경우에만 사용.
+    처리 순서: 1) 엣지 삼분할(fast_edge_check_v3) 2) 실패 시 엣지 이분할(fast_edge_check_bipartite).
+    frame_bgr은 BGR, scale_width는 코스 스캔 폭(640 등). time_sec이 있으면 로그에 시각 출력.
+    반환: (is_tripartite, is_bipartite).
+    """
+    if not CV2_AVAILABLE or frame_bgr is None or frame_bgr.ndim != 3:
+        return (False, False)
+    try:
+        from test.edge_check_ver1_down_scale import (
+            fast_edge_check_bipartite,
+            fast_edge_check_v3,
+        )
+    except ImportError:
+        return (False, False)
+    frame_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    # 다운스케일 프리셋에 따른 threshold (edge_check_ver1_down_scale과 동일)
+    if scale_width <= 480:
+        threshold_mult = 3.5
+    elif scale_width <= 640:
+        threshold_mult = 4.0
+    elif scale_width <= 960:
+        threshold_mult = 4.5
+    else:
+        threshold_mult = 5.0
+    is_tri, _, _ = fast_edge_check_v3(
+        frame_gray,
+        search_range=search_range,
+        threshold_mult=threshold_mult,
+        time_sec=time_sec,
+    )
+    is_bi = False
+    if not is_tri:
+        is_bi, _ = fast_edge_check_bipartite(
+            frame_gray,
+            search_range=search_range,
+            threshold_mult=threshold_mult,
+            time_sec=time_sec,
+        )
+    return (is_tri, is_bi)
+
+
 def format_ts(sec: float) -> str:
     """초 단위 시간을 HH:MM:SS.mmm 형식으로."""
     h = int(sec // 3600)
@@ -637,10 +691,12 @@ def _print_progress(
 
 
 def _coarse_worker(args: tuple) -> tuple[float, bool]:
-    """멀티프로세싱용: (path_str, t, width, height, left_right_only, use_gpu, scale_width?, cache_dir?, align_tolerance_px?) → (t, is_tripartite).
+    """멀티프로세싱용: (path_str, t, width, height, left_right_only, use_gpu, scale_width?, cache_dir?, align_tolerance_px?, use_edge_fallback?, edge_scale_width?) → (t, is_tripartite).
     scale_width가 None이 아니면 코스 스캔만 저해상도. cache_dir이 있으면 해당 프레임을 .npy로 저장."""
     path_str, t, width, height, left_right_only, use_gpu, scale_width, cache_dir = args[:8]
     align_tol_px = int(args[8]) if len(args) > 8 and args[8] is not None else None
+    use_edge_fallback = bool(args[9]) if len(args) > 9 else False
+    edge_scale_width = int(args[10]) if len(args) > 10 and args[10] is not None else None
     path = Path(path_str)
     frame = extract_frame(path, t, width, height, use_gpu, scale_width=scale_width)
     if frame is None:
@@ -651,7 +707,18 @@ def _coarse_worker(args: tuple) -> tuple[float, bool]:
             np.save(out, frame)
         except (OSError, ValueError):
             pass
-    return (t, is_tripartite_frame(frame, left_right_only, use_gpu, align_tolerance_px=align_tol_px))
+    is_tri = is_tripartite_frame(
+        frame, left_right_only, use_gpu, align_tolerance_px=align_tol_px
+    )
+    if not is_tri and use_edge_fallback:
+        w = frame.shape[1] if frame is not None else 0
+        scale_for_fallback = edge_scale_width if edge_scale_width is not None else w
+        is_tri_edge, is_bi = _edge_fallback_detect(
+            frame, scale_for_fallback, time_sec=t
+        )
+        if is_tri_edge or is_bi:
+            is_tri = True
+    return (t, is_tri)
 
 
 def _get_frame_for_check(
@@ -695,15 +762,27 @@ def _check_tripartite_at(
     cached_times: list[float] | None = None,
     cache_usable: bool = False,
     align_tolerance_px: int | None = None,
+    use_edge_fallback: bool = False,
+    edge_scale_width: int | None = None,
 ) -> bool:
     """시점 t에서 1프레임 추출(또는 캐시 로드) 후 삼분할 여부 반환."""
     if cache_usable and cache_dir is not None and cached_times is not None:
         frame = _get_frame_for_check(path, t, width, height, use_gpu, cache_dir, cached_times)
     else:
         frame = extract_frame(path, t, width, height, use_gpu)
-    return frame is not None and is_tripartite_frame(
+    if frame is None:
+        return False
+    is_tri = is_tripartite_frame(
         frame, left_right_only, use_gpu, align_tolerance_px=align_tolerance_px
     )
+    if not is_tri and use_edge_fallback:
+        scale_for_fallback = edge_scale_width if edge_scale_width is not None else frame.shape[1]
+        is_tri_edge, is_bi = _edge_fallback_detect(
+            frame, scale_for_fallback, time_sec=t
+        )
+        if is_tri_edge or is_bi:
+            is_tri = True
+    return is_tri
 
 
 def _binary_search_first_tripartite(
@@ -719,6 +798,8 @@ def _binary_search_first_tripartite(
     cache_usable: bool = False,
     tolerance_sec: float | None = None,
     align_tolerance_px: int | None = None,
+    use_edge_fallback: bool = False,
+    edge_scale_width: int | None = None,
 ) -> float:
     """[t_low, t_high] 구간에서 삼분할이 처음 나오는 시점을 이진 탐색. (t_high에서 True인 전제)"""
     tol = tolerance_sec if tolerance_sec is not None else BOUNDARY_TOLERANCE
@@ -726,6 +807,7 @@ def _binary_search_first_tripartite(
         path, t_low, width, height, left_right_only, use_gpu,
         cache_dir=cache_dir, cached_times=cached_times, cache_usable=cache_usable,
         align_tolerance_px=align_tolerance_px,
+        use_edge_fallback=use_edge_fallback, edge_scale_width=edge_scale_width,
     ):
         return t_low
     while t_high - t_low > tol:
@@ -734,6 +816,7 @@ def _binary_search_first_tripartite(
             path, mid, width, height, left_right_only, use_gpu,
             cache_dir=cache_dir, cached_times=cached_times, cache_usable=cache_usable,
             align_tolerance_px=align_tolerance_px,
+            use_edge_fallback=use_edge_fallback, edge_scale_width=edge_scale_width,
         ):
             t_high = mid
         else:
@@ -754,6 +837,8 @@ def _binary_search_last_tripartite(
     cache_usable: bool = False,
     tolerance_sec: float | None = None,
     align_tolerance_px: int | None = None,
+    use_edge_fallback: bool = False,
+    edge_scale_width: int | None = None,
 ) -> float:
     """[t_low, t_high] 구간에서 삼분할이 마지막으로 나오는 시점을 이진 탐색. (t_low에서 True인 전제)"""
     tol = tolerance_sec if tolerance_sec is not None else BOUNDARY_TOLERANCE
@@ -761,6 +846,7 @@ def _binary_search_last_tripartite(
         path, t_high, width, height, left_right_only, use_gpu,
         cache_dir=cache_dir, cached_times=cached_times, cache_usable=cache_usable,
         align_tolerance_px=align_tolerance_px,
+        use_edge_fallback=use_edge_fallback, edge_scale_width=edge_scale_width,
     ):
         return t_high
     while t_high - t_low > tol:
@@ -769,6 +855,7 @@ def _binary_search_last_tripartite(
             path, mid, width, height, left_right_only, use_gpu,
             cache_dir=cache_dir, cached_times=cached_times, cache_usable=cache_usable,
             align_tolerance_px=align_tolerance_px,
+            use_edge_fallback=use_edge_fallback, edge_scale_width=edge_scale_width,
         ):
             t_low = mid
         else:
@@ -779,7 +866,7 @@ def _binary_search_last_tripartite(
 def _boundary_worker(args: tuple) -> tuple[float, float] | None:
     """
     멀티프로세싱용: 한 후보 구간의 시작·끝을 이진 탐색으로 정밀화.
-    인자 끝에 cache_dir, cached_times, cache_usable, boundary_tolerance_sec, align_tolerance_px 추가 가능.
+    인자 끝에 cache_dir, cached_times, cache_usable, boundary_tolerance_sec, align_tolerance_px, use_edge_fallback, edge_scale_width 추가 가능.
     """
     n = len(args)
     path_str, t_prev, t_start_cand, t_end_cand, t_next, duration, width, height, left_right_only, use_gpu = args[:10]
@@ -788,16 +875,20 @@ def _boundary_worker(args: tuple) -> tuple[float, float] | None:
     cache_usable = bool(args[12]) if n > 12 else False
     tolerance_sec = float(args[13]) if n > 13 and args[13] is not None else None
     align_tol_px = int(args[14]) if n > 14 and args[14] is not None else None
+    use_edge_fallback = bool(args[15]) if n > 15 else False
+    edge_scale_width = int(args[16]) if n > 16 and args[16] is not None else None
     path = Path(path_str)
     t_start = _binary_search_first_tripartite(
         path, t_prev, t_start_cand, width, height, left_right_only, use_gpu,
         cache_dir=cache_dir, cached_times=cached_times, cache_usable=cache_usable,
         tolerance_sec=tolerance_sec, align_tolerance_px=align_tol_px,
+        use_edge_fallback=use_edge_fallback, edge_scale_width=edge_scale_width,
     )
     t_end = _binary_search_last_tripartite(
         path, t_end_cand, min(t_next, duration), width, height, left_right_only, use_gpu,
         cache_dir=cache_dir, cached_times=cached_times, cache_usable=cache_usable,
         tolerance_sec=tolerance_sec, align_tolerance_px=align_tol_px,
+        use_edge_fallback=use_edge_fallback, edge_scale_width=edge_scale_width,
     )
     if t_end <= duration and (t_end - t_start) >= 0:
         return (t_start, t_end)
@@ -822,6 +913,7 @@ def find_segments(
     use_coarse_cache: bool = False,
     boundary_tolerance_sec: float | None = None,
     align_tolerance_px: int | None = None,
+    use_edge_fallback: bool = False,
 ) -> tuple[list[tuple[float, float]], dict[str, float]]:
     """
     삼분할 구간 탐색 (장편 영상 최적화).
@@ -855,7 +947,19 @@ def find_segments(
             ts.append(max(0.0, duration - 0.1))
         total_points = len(ts)
         worker_args = [
-            (path_str, t, width, height, left_right_only, use_gpu, scale_w, cache_dir_str, align_tolerance_px)
+            (
+                path_str,
+                t,
+                width,
+                height,
+                left_right_only,
+                use_gpu,
+                scale_w,
+                cache_dir_str,
+                align_tolerance_px,
+                use_edge_fallback,
+                scale_w,
+            )
             for t in ts
         ]
         timings["시점 목록"] = time.perf_counter() - t0
@@ -864,7 +968,7 @@ def find_segments(
         scan_start = time.perf_counter()
 
         if n_workers <= 1:
-            for i, (_path_s, t, w, h, lr, ug, sw, _cd, align_tol) in enumerate(worker_args):
+            for i, (_path_s, t, w, h, lr, ug, sw, _cd, align_tol, use_ef, edge_sw) in enumerate(worker_args):
                 frame = extract_frame(path, t, w, h, ug, scale_width=sw)
                 if frame is None:
                     coarse_results.append((t, False))
@@ -874,7 +978,15 @@ def find_segments(
                             np.save(cache_dir / f"frame_{t:.3f}.npy", frame)
                         except (OSError, ValueError):
                             pass
-                    coarse_results.append((t, is_tripartite_frame(frame, lr, ug, align_tolerance_px=align_tol)))
+                    is_tri = is_tripartite_frame(frame, lr, ug, align_tolerance_px=align_tol)
+                    if not is_tri and use_ef:
+                        scale_for_fallback = edge_sw if edge_sw is not None else frame.shape[1]
+                        is_tri_edge, is_bi = _edge_fallback_detect(
+                            frame, scale_for_fallback, time_sec=t
+                        )
+                        if is_tri_edge or is_bi:
+                            is_tri = True
+                    coarse_results.append((t, is_tri))
                 if (i + 1) % 30 == 0:
                     _print_progress(ts[i], duration, scan_start, i + 1, total_points)
         else:
@@ -944,6 +1056,8 @@ def find_segments(
                     cache_usable_in_boundary,
                     boundary_tol,
                     align_tolerance_px,
+                    use_edge_fallback,
+                    width,
                 )
             )
             i = j
@@ -954,16 +1068,18 @@ def find_segments(
         segments = []
         if n_workers <= 1 or len(candidates) == 0:
             for c in candidates:
-                (_path_s, t_prev, t_start_cand, t_end_cand, t_next, _dur, w, h, lr, ug, _cd, _ct, cache_ok, tol, align_tol) = c
+                (_path_s, t_prev, t_start_cand, t_end_cand, t_next, _dur, w, h, lr, ug, _cd, _ct, cache_ok, tol, align_tol, use_ef, edge_sw) = c
                 t_start = _binary_search_first_tripartite(
                     path, t_prev, t_start_cand, w, h, lr, ug,
                     cache_dir=cache_dir, cached_times=cached_times if cache_ok else None, cache_usable=cache_ok,
                     tolerance_sec=tol, align_tolerance_px=align_tol,
+                    use_edge_fallback=use_ef, edge_scale_width=edge_sw,
                 )
                 t_end = _binary_search_last_tripartite(
                     path, t_end_cand, min(t_next, duration), w, h, lr, ug,
                     cache_dir=cache_dir, cached_times=cached_times if cache_ok else None, cache_usable=cache_ok,
                     tolerance_sec=tol, align_tolerance_px=align_tol,
+                    use_edge_fallback=use_ef, edge_scale_width=edge_sw,
                 )
                 if t_end <= duration and (t_end - t_start) >= 0:
                     segments.append((t_start, t_end))
@@ -1177,7 +1293,7 @@ def _merge_notify(mode: str, output_path: Path, n_segments: int) -> None:
                 # Windows 11/10 호환: win11toast 우선 (WinRT 기반, Win11 25H2 등에서 동작)
                 from win11toast import notify
                 notify(
-                    "삼분할 병합 완료",
+                    "검출된 구간 병합 완료",
                     f"{output_path.name}  ({n_segments}개 구간)\n클릭 시 폴더에서 파일 위치 열기",
                     on_click=_open_in_explorer,
                 )
@@ -1189,7 +1305,7 @@ def _merge_notify(mode: str, output_path: Path, n_segments: int) -> None:
                 from win10toast_click import ToastNotifier
                 toaster = ToastNotifier()
                 toaster.show_toast(
-                    "삼분할 병합 완료",
+                    "검출된 구간 병합 완료",
                     f"{output_path.name}  ({n_segments}개 구간)\n클릭 시 폴더에서 파일 위치 열기",
                     duration=5,
                     threaded=True,
@@ -1201,7 +1317,7 @@ def _merge_notify(mode: str, output_path: Path, n_segments: int) -> None:
         try:
             from plyer import notification
             notification.notify(
-                title="삼분할 병합 완료",
+                title="검출된 구간 병합 완료",
                 message=f"{output_path.name}  ({n_segments}개 구간)",
                 timeout=5,
             )
@@ -1432,6 +1548,11 @@ def main() -> None:
         help="코스 스캔 시 각 시점 프레임을 임시 폴더에 캐시. 경계 정밀화에서 원본 해상도일 때만 재사용 후 작업 끝에 삭제. --coarse-scale과 함께 사용 가능(캐시는 저장만, 경계에서는 원본 해상도 사용).",
     )
     parser.add_argument(
+        "--edge-fallback",
+        action="store_true",
+        help="처리 순서: 삼분할(MSE) → 실패 시 신규 삼분할(엣지) → 실패 시 이분할(엣지). test/edge_check_ver1_down_scale 알고리즘 추가 적용. scale 640 사용 시 미검출 보완용.",
+    )
+    parser.add_argument(
         "--boundary-tolerance",
         type=float,
         default=None,
@@ -1642,7 +1763,7 @@ def main() -> None:
                 sys.exit(1)
             print(f"입력: {path}")
             print(f"구간 목록: {seg_file}  (총 {len(segments)}개)")
-            print("삼분할 구간:")
+            print("검출된 구간:")
             total_length_sec = 0.0
             for i, (start, end) in enumerate(segments, 1):
                 seg_len = end - start
@@ -1714,6 +1835,7 @@ def main() -> None:
         print("-" * 50)
 
         use_coarse_cache = getattr(args, "coarse_cache", False)
+        use_edge_fallback = getattr(args, "edge_fallback", False)
         segments, phase_timings = find_segments(
             path, duration, width, height,
             min_duration_sec=min_dur,
@@ -1725,6 +1847,7 @@ def main() -> None:
             use_coarse_cache=use_coarse_cache,
             boundary_tolerance_sec=args.boundary_tolerance,
             align_tolerance_px=args.align_tolerance,
+            use_edge_fallback=use_edge_fallback,
         )
 
         run_elapsed = time.perf_counter() - run_start
@@ -1756,10 +1879,10 @@ def main() -> None:
         print("-" * 50)
 
         if not segments:
-            print("삼분할 구간이 없습니다.")
+            print("검출된 구간이 없습니다.")
             return
 
-        print("삼분할 구간:")
+        print("검출된 구간:")
         total_length_sec = 0.0
         for i, (start, end) in enumerate(segments, 1):
             seg_len = end - start
