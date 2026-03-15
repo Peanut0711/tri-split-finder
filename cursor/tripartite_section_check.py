@@ -422,6 +422,11 @@ def get_tripartite_mse(
 # ========== Edge-based fallback (선택 사항) ==========
 # --edge-fallback 시 처리 순서: 삼분할(MSE) → 실패 시 신규 삼분할(엣지) → 실패 시 이분할(엣지).
 # 이분할까지 감지되면 해당 시점도 구간에 포함되며, 인접 시 삼분할 구간과 하나로 합쳐짐(검출된 구간).
+# 엣지 검출 후 test/edge_check_ver1_down_scale과 동일하게 좌·중·우(또는 좌·우) 패치 유사도 검증 적용.
+EDGE_VERIFY_TRIPARTITE_DUPLICATE = True  # 삼분할 시 좌·중·우 9패치 유사도 검증
+EDGE_VERIFY_BIPARTITE_DUPLICATE = True   # 이분할 시 좌/우 절반·패치 유사도 검증
+EDGE_DUPLICATE_SIMILARITY_THRESHOLD = 0.92  # 유사도 기준 (0~1). 이 이상이면 동일 영상 복붙으로 인정
+
 # 제거 시: 아래 함수 삭제, _coarse_worker/순차 분기/_check_tripartite_at 내 fallback 호출 제거,
 # find_segments·_boundary_worker·main 의 use_edge_fallback 관련 인자/CLI 제거.
 def _edge_fallback_detect(
@@ -429,16 +434,27 @@ def _edge_fallback_detect(
     scale_width: int,
     search_range: int = 40,
     time_sec: float | None = None,
+    verify_tripartite_duplicate: bool | None = None,
+    verify_bipartite_duplicate: bool | None = None,
+    duplicate_similarity_threshold: float | None = None,
 ) -> tuple[bool, bool]:
     """
     엣지 기반 삼분할 → 이분할 순서로 판정 (test/edge_check_ver1_down_scale 알고리즘).
     호출 조건: 메인(MSE) 삼분할이 실패한 경우에만 사용.
     처리 순서: 1) 엣지 삼분할(fast_edge_check_v3) 2) 실패 시 엣지 이분할(fast_edge_check_bipartite).
+    삼분할: 경계선 검출 후 verify_tripartite_duplicate이 True면 좌·중·우 9패치 유사도 검증.
+    이분할: 중앙선 검출 후 verify_bipartite_duplicate이 True면 좌/우 절반·패치 유사도 검증.
     frame_bgr은 BGR, scale_width는 코스 스캔 폭(640 등). time_sec이 있으면 로그에 시각 출력.
     반환: (is_tripartite, is_bipartite).
     """
     if not CV2_AVAILABLE or frame_bgr is None or frame_bgr.ndim != 3:
         return (False, False)
+    if verify_tripartite_duplicate is None:
+        verify_tripartite_duplicate = EDGE_VERIFY_TRIPARTITE_DUPLICATE
+    if verify_bipartite_duplicate is None:
+        verify_bipartite_duplicate = EDGE_VERIFY_BIPARTITE_DUPLICATE
+    if duplicate_similarity_threshold is None:
+        duplicate_similarity_threshold = EDGE_DUPLICATE_SIMILARITY_THRESHOLD
     try:
         from test.edge_check_ver1_down_scale import (
             fast_edge_check_bipartite,
@@ -461,6 +477,8 @@ def _edge_fallback_detect(
         search_range=search_range,
         threshold_mult=threshold_mult,
         time_sec=time_sec,
+        verify_duplicate=verify_tripartite_duplicate,
+        duplicate_similarity_threshold=duplicate_similarity_threshold,
     )
     is_bi = False
     if not is_tri:
@@ -469,6 +487,8 @@ def _edge_fallback_detect(
             search_range=search_range,
             threshold_mult=threshold_mult,
             time_sec=time_sec,
+            verify_duplicate=verify_bipartite_duplicate,
+            duplicate_similarity_threshold=duplicate_similarity_threshold,
         )
     return (is_tri, is_bi)
 
@@ -691,12 +711,15 @@ def _print_progress(
 
 
 def _coarse_worker(args: tuple) -> tuple[float, bool]:
-    """멀티프로세싱용: (path_str, t, width, height, left_right_only, use_gpu, scale_width?, cache_dir?, align_tolerance_px?, use_edge_fallback?, edge_scale_width?) → (t, is_tripartite).
+    """멀티프로세싱용: (path_str, t, width, height, left_right_only, use_gpu, scale_width?, cache_dir?, align_tolerance_px?, use_edge_fallback?, edge_scale_width?, edge_verify_tri?, edge_verify_bi?, edge_dup_threshold?) → (t, is_tripartite).
     scale_width가 None이 아니면 코스 스캔만 저해상도. cache_dir이 있으면 해당 프레임을 .npy로 저장."""
     path_str, t, width, height, left_right_only, use_gpu, scale_width, cache_dir = args[:8]
     align_tol_px = int(args[8]) if len(args) > 8 and args[8] is not None else None
     use_edge_fallback = bool(args[9]) if len(args) > 9 else False
     edge_scale_width = int(args[10]) if len(args) > 10 and args[10] is not None else None
+    edge_verify_tri = bool(args[11]) if len(args) > 11 and args[11] is not None else EDGE_VERIFY_TRIPARTITE_DUPLICATE
+    edge_verify_bi = bool(args[12]) if len(args) > 12 and args[12] is not None else EDGE_VERIFY_BIPARTITE_DUPLICATE
+    edge_dup_thr = float(args[13]) if len(args) > 13 and args[13] is not None else EDGE_DUPLICATE_SIMILARITY_THRESHOLD
     path = Path(path_str)
     frame = extract_frame(path, t, width, height, use_gpu, scale_width=scale_width)
     if frame is None:
@@ -714,7 +737,10 @@ def _coarse_worker(args: tuple) -> tuple[float, bool]:
         w = frame.shape[1] if frame is not None else 0
         scale_for_fallback = edge_scale_width if edge_scale_width is not None else w
         is_tri_edge, is_bi = _edge_fallback_detect(
-            frame, scale_for_fallback, time_sec=t
+            frame, scale_for_fallback, time_sec=t,
+            verify_tripartite_duplicate=edge_verify_tri,
+            verify_bipartite_duplicate=edge_verify_bi,
+            duplicate_similarity_threshold=edge_dup_thr,
         )
         if is_tri_edge or is_bi:
             is_tri = True
@@ -764,6 +790,9 @@ def _check_tripartite_at(
     align_tolerance_px: int | None = None,
     use_edge_fallback: bool = False,
     edge_scale_width: int | None = None,
+    edge_verify_tripartite: bool | None = None,
+    edge_verify_bipartite: bool | None = None,
+    edge_duplicate_threshold: float | None = None,
 ) -> bool:
     """시점 t에서 1프레임 추출(또는 캐시 로드) 후 삼분할 여부 반환."""
     if cache_usable and cache_dir is not None and cached_times is not None:
@@ -778,7 +807,10 @@ def _check_tripartite_at(
     if not is_tri and use_edge_fallback:
         scale_for_fallback = edge_scale_width if edge_scale_width is not None else frame.shape[1]
         is_tri_edge, is_bi = _edge_fallback_detect(
-            frame, scale_for_fallback, time_sec=t
+            frame, scale_for_fallback, time_sec=t,
+            verify_tripartite_duplicate=edge_verify_tripartite,
+            verify_bipartite_duplicate=edge_verify_bipartite,
+            duplicate_similarity_threshold=edge_duplicate_threshold,
         )
         if is_tri_edge or is_bi:
             is_tri = True
@@ -800,6 +832,9 @@ def _binary_search_first_tripartite(
     align_tolerance_px: int | None = None,
     use_edge_fallback: bool = False,
     edge_scale_width: int | None = None,
+    edge_verify_tripartite: bool | None = None,
+    edge_verify_bipartite: bool | None = None,
+    edge_duplicate_threshold: float | None = None,
 ) -> float:
     """[t_low, t_high] 구간에서 삼분할이 처음 나오는 시점을 이진 탐색. (t_high에서 True인 전제)"""
     tol = tolerance_sec if tolerance_sec is not None else BOUNDARY_TOLERANCE
@@ -808,6 +843,8 @@ def _binary_search_first_tripartite(
         cache_dir=cache_dir, cached_times=cached_times, cache_usable=cache_usable,
         align_tolerance_px=align_tolerance_px,
         use_edge_fallback=use_edge_fallback, edge_scale_width=edge_scale_width,
+        edge_verify_tripartite=edge_verify_tripartite, edge_verify_bipartite=edge_verify_bipartite,
+        edge_duplicate_threshold=edge_duplicate_threshold,
     ):
         return t_low
     while t_high - t_low > tol:
@@ -817,6 +854,8 @@ def _binary_search_first_tripartite(
             cache_dir=cache_dir, cached_times=cached_times, cache_usable=cache_usable,
             align_tolerance_px=align_tolerance_px,
             use_edge_fallback=use_edge_fallback, edge_scale_width=edge_scale_width,
+            edge_verify_tripartite=edge_verify_tripartite, edge_verify_bipartite=edge_verify_bipartite,
+            edge_duplicate_threshold=edge_duplicate_threshold,
         ):
             t_high = mid
         else:
@@ -839,6 +878,9 @@ def _binary_search_last_tripartite(
     align_tolerance_px: int | None = None,
     use_edge_fallback: bool = False,
     edge_scale_width: int | None = None,
+    edge_verify_tripartite: bool | None = None,
+    edge_verify_bipartite: bool | None = None,
+    edge_duplicate_threshold: float | None = None,
 ) -> float:
     """[t_low, t_high] 구간에서 삼분할이 마지막으로 나오는 시점을 이진 탐색. (t_low에서 True인 전제)"""
     tol = tolerance_sec if tolerance_sec is not None else BOUNDARY_TOLERANCE
@@ -847,6 +889,8 @@ def _binary_search_last_tripartite(
         cache_dir=cache_dir, cached_times=cached_times, cache_usable=cache_usable,
         align_tolerance_px=align_tolerance_px,
         use_edge_fallback=use_edge_fallback, edge_scale_width=edge_scale_width,
+        edge_verify_tripartite=edge_verify_tripartite, edge_verify_bipartite=edge_verify_bipartite,
+        edge_duplicate_threshold=edge_duplicate_threshold,
     ):
         return t_high
     while t_high - t_low > tol:
@@ -856,6 +900,8 @@ def _binary_search_last_tripartite(
             cache_dir=cache_dir, cached_times=cached_times, cache_usable=cache_usable,
             align_tolerance_px=align_tolerance_px,
             use_edge_fallback=use_edge_fallback, edge_scale_width=edge_scale_width,
+            edge_verify_tripartite=edge_verify_tripartite, edge_verify_bipartite=edge_verify_bipartite,
+            edge_duplicate_threshold=edge_duplicate_threshold,
         ):
             t_low = mid
         else:
@@ -866,7 +912,7 @@ def _binary_search_last_tripartite(
 def _boundary_worker(args: tuple) -> tuple[float, float] | None:
     """
     멀티프로세싱용: 한 후보 구간의 시작·끝을 이진 탐색으로 정밀화.
-    인자 끝에 cache_dir, cached_times, cache_usable, boundary_tolerance_sec, align_tolerance_px, use_edge_fallback, edge_scale_width 추가 가능.
+    인자 끝에 cache_dir, cached_times, cache_usable, boundary_tolerance_sec, align_tolerance_px, use_edge_fallback, edge_scale_width, edge_verify_tri, edge_verify_bi, edge_dup_threshold 추가 가능.
     """
     n = len(args)
     path_str, t_prev, t_start_cand, t_end_cand, t_next, duration, width, height, left_right_only, use_gpu = args[:10]
@@ -877,18 +923,25 @@ def _boundary_worker(args: tuple) -> tuple[float, float] | None:
     align_tol_px = int(args[14]) if n > 14 and args[14] is not None else None
     use_edge_fallback = bool(args[15]) if n > 15 else False
     edge_scale_width = int(args[16]) if n > 16 and args[16] is not None else None
+    edge_verify_tri = bool(args[17]) if n > 17 and args[17] is not None else EDGE_VERIFY_TRIPARTITE_DUPLICATE
+    edge_verify_bi = bool(args[18]) if n > 18 and args[18] is not None else EDGE_VERIFY_BIPARTITE_DUPLICATE
+    edge_dup_thr = float(args[19]) if n > 19 and args[19] is not None else EDGE_DUPLICATE_SIMILARITY_THRESHOLD
     path = Path(path_str)
     t_start = _binary_search_first_tripartite(
         path, t_prev, t_start_cand, width, height, left_right_only, use_gpu,
         cache_dir=cache_dir, cached_times=cached_times, cache_usable=cache_usable,
         tolerance_sec=tolerance_sec, align_tolerance_px=align_tol_px,
         use_edge_fallback=use_edge_fallback, edge_scale_width=edge_scale_width,
+        edge_verify_tripartite=edge_verify_tri, edge_verify_bipartite=edge_verify_bi,
+        edge_duplicate_threshold=edge_dup_thr,
     )
     t_end = _binary_search_last_tripartite(
         path, t_end_cand, min(t_next, duration), width, height, left_right_only, use_gpu,
         cache_dir=cache_dir, cached_times=cached_times, cache_usable=cache_usable,
         tolerance_sec=tolerance_sec, align_tolerance_px=align_tol_px,
         use_edge_fallback=use_edge_fallback, edge_scale_width=edge_scale_width,
+        edge_verify_tripartite=edge_verify_tri, edge_verify_bipartite=edge_verify_bi,
+        edge_duplicate_threshold=edge_dup_thr,
     )
     if t_end <= duration and (t_end - t_start) >= 0:
         return (t_start, t_end)
@@ -914,6 +967,9 @@ def find_segments(
     boundary_tolerance_sec: float | None = None,
     align_tolerance_px: int | None = None,
     use_edge_fallback: bool = False,
+    edge_verify_tripartite: bool | None = None,
+    edge_verify_bipartite: bool | None = None,
+    edge_duplicate_threshold: float | None = None,
 ) -> tuple[list[tuple[float, float]], dict[str, float]]:
     """
     삼분할 구간 탐색 (장편 영상 최적화).
@@ -925,6 +981,9 @@ def find_segments(
     timings: dict[str, float] = {}
     path_str = str(path.resolve())
     scale_w = coarse_scale_width if coarse_scale_width in COARSE_SCALE_WIDTHS else None
+    v_tri = edge_verify_tripartite if edge_verify_tripartite is not None else EDGE_VERIFY_TRIPARTITE_DUPLICATE
+    v_bi = edge_verify_bipartite if edge_verify_bipartite is not None else EDGE_VERIFY_BIPARTITE_DUPLICATE
+    dup_thr = edge_duplicate_threshold if edge_duplicate_threshold is not None else EDGE_DUPLICATE_SIMILARITY_THRESHOLD
 
     cache_dir: Path | None = None
     if use_coarse_cache:
@@ -959,6 +1018,9 @@ def find_segments(
                 align_tolerance_px,
                 use_edge_fallback,
                 scale_w,
+                v_tri,
+                v_bi,
+                dup_thr,
             )
             for t in ts
         ]
@@ -968,7 +1030,7 @@ def find_segments(
         scan_start = time.perf_counter()
 
         if n_workers <= 1:
-            for i, (_path_s, t, w, h, lr, ug, sw, _cd, align_tol, use_ef, edge_sw) in enumerate(worker_args):
+            for i, (_path_s, t, w, h, lr, ug, sw, _cd, align_tol, use_ef, edge_sw, _v_tri, _v_bi, _dup_thr) in enumerate(worker_args):
                 frame = extract_frame(path, t, w, h, ug, scale_width=sw)
                 if frame is None:
                     coarse_results.append((t, False))
@@ -982,7 +1044,10 @@ def find_segments(
                     if not is_tri and use_ef:
                         scale_for_fallback = edge_sw if edge_sw is not None else frame.shape[1]
                         is_tri_edge, is_bi = _edge_fallback_detect(
-                            frame, scale_for_fallback, time_sec=t
+                            frame, scale_for_fallback, time_sec=t,
+                            verify_tripartite_duplicate=_v_tri,
+                            verify_bipartite_duplicate=_v_bi,
+                            duplicate_similarity_threshold=_dup_thr,
                         )
                         if is_tri_edge or is_bi:
                             is_tri = True
@@ -1058,6 +1123,9 @@ def find_segments(
                     align_tolerance_px,
                     use_edge_fallback,
                     width,
+                    v_tri,
+                    v_bi,
+                    dup_thr,
                 )
             )
             i = j
@@ -1068,18 +1136,20 @@ def find_segments(
         segments = []
         if n_workers <= 1 or len(candidates) == 0:
             for c in candidates:
-                (_path_s, t_prev, t_start_cand, t_end_cand, t_next, _dur, w, h, lr, ug, _cd, _ct, cache_ok, tol, align_tol, use_ef, edge_sw) = c
+                (_path_s, t_prev, t_start_cand, t_end_cand, t_next, _dur, w, h, lr, ug, _cd, _ct, cache_ok, tol, align_tol, use_ef, edge_sw, _v_tri, _v_bi, _dup_thr) = c
                 t_start = _binary_search_first_tripartite(
                     path, t_prev, t_start_cand, w, h, lr, ug,
                     cache_dir=cache_dir, cached_times=cached_times if cache_ok else None, cache_usable=cache_ok,
                     tolerance_sec=tol, align_tolerance_px=align_tol,
                     use_edge_fallback=use_ef, edge_scale_width=edge_sw,
+                    edge_verify_tripartite=_v_tri, edge_verify_bipartite=_v_bi, edge_duplicate_threshold=_dup_thr,
                 )
                 t_end = _binary_search_last_tripartite(
                     path, t_end_cand, min(t_next, duration), w, h, lr, ug,
                     cache_dir=cache_dir, cached_times=cached_times if cache_ok else None, cache_usable=cache_ok,
                     tolerance_sec=tol, align_tolerance_px=align_tol,
                     use_edge_fallback=use_ef, edge_scale_width=edge_sw,
+                    edge_verify_tripartite=_v_tri, edge_verify_bipartite=_v_bi, edge_duplicate_threshold=_dup_thr,
                 )
                 if t_end <= duration and (t_end - t_start) >= 0:
                     segments.append((t_start, t_end))
@@ -1512,6 +1582,7 @@ def merge_segments(
 
 
 def main() -> None:
+    global EDGE_VERIFY_TRIPARTITE_DUPLICATE, EDGE_VERIFY_BIPARTITE_DUPLICATE, EDGE_DUPLICATE_SIMILARITY_THRESHOLD
     parser = argparse.ArgumentParser(description="영상에서 삼분할 구간 검출 (y 중앙부 샘플)")
     parser.add_argument("input", type=Path, help="입력 영상 파일 (예: input.ts)")
     parser.add_argument("--no-min-duration", action="store_true", help="최소 구간 길이(20초) 검사 없이 모두 출력")
@@ -1550,7 +1621,24 @@ def main() -> None:
     parser.add_argument(
         "--edge-fallback",
         action="store_true",
-        help="처리 순서: 삼분할(MSE) → 실패 시 신규 삼분할(엣지) → 실패 시 이분할(엣지). test/edge_check_ver1_down_scale 알고리즘 추가 적용. scale 640 사용 시 미검출 보완용.",
+        help="처리 순서: 삼분할(MSE) → 실패 시 신규 삼분할(엣지) → 실패 시 이분할(엣지). test/edge_check_ver1_down_scale 알고리즘 + 좌·중·우/좌·우 패치 유사도 검증 적용. scale 640 사용 시 미검출 보완용.",
+    )
+    parser.add_argument(
+        "--no-verify-edge-tripartite",
+        action="store_true",
+        help="--edge-fallback 시 삼분할 엣지 검출 후 좌·중·우 패치 유사도 검증 생략",
+    )
+    parser.add_argument(
+        "--no-verify-edge-duplicate",
+        action="store_true",
+        help="--edge-fallback 시 이분할 엣지 검출 후 좌/우 동일 영상 유사도 검증 생략",
+    )
+    parser.add_argument(
+        "--edge-duplicate-threshold",
+        type=float,
+        default=EDGE_DUPLICATE_SIMILARITY_THRESHOLD,
+        metavar="F",
+        help="--edge-fallback 시 삼/이분할 패치 유사도 기준 (0~1). 기본 %(default)s. 좌==우 or 중==좌 or 중==우 등 하나만 만족해도 통과",
     )
     parser.add_argument(
         "--boundary-tolerance",
@@ -1836,6 +1924,11 @@ def main() -> None:
 
         use_coarse_cache = getattr(args, "coarse_cache", False)
         use_edge_fallback = getattr(args, "edge_fallback", False)
+        # --edge-fallback 시 유사도·패치 검증 옵션 (test/edge_check_ver1_down_scale 방식)
+        if use_edge_fallback:
+            EDGE_VERIFY_TRIPARTITE_DUPLICATE = not getattr(args, "no_verify_edge_tripartite", False)
+            EDGE_VERIFY_BIPARTITE_DUPLICATE = not getattr(args, "no_verify_edge_duplicate", False)
+            EDGE_DUPLICATE_SIMILARITY_THRESHOLD = getattr(args, "edge_duplicate_threshold", EDGE_DUPLICATE_SIMILARITY_THRESHOLD)
         segments, phase_timings = find_segments(
             path, duration, width, height,
             min_duration_sec=min_dur,
@@ -1848,6 +1941,9 @@ def main() -> None:
             boundary_tolerance_sec=args.boundary_tolerance,
             align_tolerance_px=args.align_tolerance,
             use_edge_fallback=use_edge_fallback,
+            edge_verify_tripartite=EDGE_VERIFY_TRIPARTITE_DUPLICATE,
+            edge_verify_bipartite=EDGE_VERIFY_BIPARTITE_DUPLICATE,
+            edge_duplicate_threshold=EDGE_DUPLICATE_SIMILARITY_THRESHOLD,
         )
 
         run_elapsed = time.perf_counter() - run_start
