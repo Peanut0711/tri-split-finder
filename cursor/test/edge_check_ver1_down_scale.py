@@ -22,6 +22,13 @@ def _format_time_sec(time_sec):
     return f"{h:02d}:{m:02d}:{s:06.3f}"
 
 
+def _edge_log_prefix(time_sec):
+    """엣지 검출 로그용 접두어. time_sec 있으면 [HH:MM:SS.mmm] 없으면 빈 문자열."""
+    if time_sec is None:
+        return ""
+    return f"[{_format_time_sec(time_sec)}] "
+
+
 def fast_edge_check_v3(
     frame_gray,
     search_range=40,
@@ -90,12 +97,11 @@ def fast_edge_check_v3(
         )
         is_tripartite = is_verified
         if pass_strength and gap_valid and not is_verified:
-            print(f"⚠️ 삼분할 경계선은 있으나 좌·중·우 동일 영상 아님 (유사도 검증 실패: {detail}) → 삼분할 미판정")
+            print(f"{_edge_log_prefix(time_sec)}삼분할 미판정: 경계선은 있으나 좌·중·우 동일 영상 아님 (유사도 검증 실패: {detail})")
 
     # 디버깅 정보
     if is_tripartite:
-        ts_str = f" 시각 {_format_time_sec(time_sec)}" if time_sec is not None else ""
-        print(f"🎯 경계선 탐지 성공! 위치: ({peak_l_idx}, {peak_r_idx}), 간격: {actual_gap}px (기대: {expected_gap}px){ts_str}")
+        print(f"{_edge_log_prefix(time_sec)}삼분할 탐지: 위치 ({peak_l_idx}, {peak_r_idx}), 간격 {actual_gap}px (기대: {expected_gap}px)")
 
     return is_tripartite, peak_l_idx, peak_r_idx
 
@@ -307,15 +313,14 @@ def fast_edge_check_bipartite(
         )
         is_bipartite = is_dup
         if has_center_edge and not is_dup:
-            print(f"⚠️ 중앙 경계선은 있으나 좌/우 동일 영상 아님 (유사도 검증 실패: {detail}) → 이분할 미판정")
+            print(f"{_edge_log_prefix(time_sec)}이분할 미판정: 중앙 경계선은 있으나 좌/우 동일 영상 아님 (유사도 검증 실패: {detail})")
         else:
             detail_success = detail
 
     if is_bipartite:
-        ts_str = f" 시각 {_format_time_sec(time_sec)}" if time_sec is not None else ""
-        msg = f"🎯 이분할 경계선 탐지 성공! 위치: {peak_idx}px (중앙 {center} 부근){ts_str}"
+        msg = f"{_edge_log_prefix(time_sec)}이분할 탐지: 위치 {peak_idx}px (중앙 {center} 부근)"
         if detail_success is not None:
-            msg += f"  (검증: {detail_success})"
+            msg += f" (검증: {detail_success})"
         print(msg)
 
     return is_bipartite, peak_idx
@@ -460,11 +465,11 @@ def run_edge_check(
         out_path = os.path.join(debug_dir, base_name + suffix_stem + f"_({n}).jpg")
     cv2.imwrite(out_path, debug_img)
     if is_tri:
-        print(f"📍 경계선 좌표 확인 완료: {p_l}px, {p_r}px (저장: {out_path})")
+        print(f"경계선 좌표 확인 완료: {p_l}px, {p_r}px (저장: {out_path})")
     elif is_bi:
-        print(f"📍 이분할 경계선 좌표 확인 완료: {p_center}px (저장: {out_path})")
+        print(f"이분할 경계선 좌표 확인 완료: {p_center}px (저장: {out_path})")
     else:
-        print(f"📍 경계선 미충족 (L:{p_l}, R:{p_r}) (저장: {out_path})")
+        print(f"경계선 미충족 (L:{p_l}, R:{p_r}) (저장: {out_path})")
 
 
 def main():
