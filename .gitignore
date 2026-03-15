@@ -4,3 +4,4 @@ cursor/Logs/
 antigravity/__pycache__/
 antigravity/logs/
 cursor/test/image/
+cursor/debug/
