@@ -22,13 +22,23 @@ def _format_time_sec(time_sec):
     return f"{h:02d}:{m:02d}:{s:06.3f}"
 
 
-def fast_edge_check_v3(frame_gray, search_range=40, threshold_mult=5.0, time_sec=None):
+def fast_edge_check_v3(
+    frame_gray,
+    search_range=40,
+    threshold_mult=5.0,
+    time_sec=None,
+    verify_duplicate=True,
+    duplicate_similarity_threshold=0.92,
+):
     """
     w*1/3, w*2/3 부근 피크 검색 + 간격 조건으로 삼분할 판정.
+    verify_duplicate=True이면 좌·중·우 패치 유사도 검증 후 통과 시에만 삼분할 판정.
     :param frame_gray: 그레이스케일 이미지 (H, W)
-    :param search_range: 1/3, 2/3 지점 주변 검색 범위(픽셀). FHD에서 666/1311 수준까지 검사하려면 40 이상.
+    :param search_range: 1/3, 2/3 지점 주변 검색 범위(픽셀).
     :param threshold_mult: 로컬 참조 대비 이 배수 이상이면 엣지 있음으로 간주.
-    :param time_sec: 영상 시각(초). 주어지면 로그에 시각 출력 (tripartite_section_check 연동용).
+    :param time_sec: 영상 시각(초). 주어지면 로그에 시각 출력.
+    :param verify_duplicate: True면 좌·중·우 9패치 검증 후 통과할 때만 삼분할 판정.
+    :param duplicate_similarity_threshold: 패치 유사도 기준 (0~1). 좌==우 or 중==좌 or 중==우 중 하나 만족 시 통과.
     :return: (is_tripartite, peak_l_idx, peak_r_idx)
     """
     h, w = frame_gray.shape
@@ -64,13 +74,23 @@ def fast_edge_check_v3(frame_gray, search_range=40, threshold_mult=5.0, time_sec
 
     # 5. [핵심] 간격 조건 검증 (기대 간격 w/3 ± 허용오차)
     actual_gap = peak_r_idx - peak_l_idx
-    # 기대 간격의 약 5% 허용 (1920→±32px, 609~671 통과) — 픽셀 단위 오차 수용
     gap_tolerance = max(15, expected_gap // 20)
     gap_valid = abs(actual_gap - expected_gap) <= gap_tolerance
 
-    # 6. 최종 판정
+    # 6. 엣지 강도 + 간격 통과 시, 선택적으로 좌·중·우 패치 검증
     pass_strength = (peak_l_val > local_ref) and (peak_r_val > local_ref)
     is_tripartite = pass_strength and gap_valid
+
+    if is_tripartite and verify_duplicate:
+        is_verified, detail = verify_left_center_right_tripartite(
+            frame_gray,
+            peak_l_idx,
+            peak_r_idx,
+            similarity_threshold=duplicate_similarity_threshold,
+        )
+        is_tripartite = is_verified
+        if pass_strength and gap_valid and not is_verified:
+            print(f"⚠️ 삼분할 경계선은 있으나 좌·중·우 동일 영상 아님 (유사도 검증 실패: {detail}) → 삼분할 미판정")
 
     # 디버깅 정보
     if is_tripartite:
@@ -90,6 +110,86 @@ def _patch_similarity(patch_l, patch_r):
     diff = np.abs(patch_l.astype(np.float64) - patch_r.astype(np.float64))
     mean_diff = np.mean(diff)
     return max(0.0, 1.0 - mean_diff / 255.0)
+
+
+def verify_left_center_right_tripartite(
+    frame_gray,
+    peak_l_idx,
+    peak_r_idx,
+    patch_size=50,
+    similarity_threshold=0.92,
+):
+    """
+    삼분할 영상에서 좌·중·우 구역이 동일(유사)한지 패치로 검증.
+    화면을 삼등분(좌/중/우) × 상·중·하로 9개 위치에 패치를 두고,
+    각 위치에서 (좌==우) or (중==좌) or (중==우) 중 하나만 만족하면 해당 위치 통과.
+    9개 위치 중 하나라도 통과하면 삼분할(동일 영상 3연복)로 판단.
+
+    :param frame_gray: 그레이스케일 (H, W)
+    :param peak_l_idx: 좌측 경계 x (중앙 구역 시작)
+    :param peak_r_idx: 우측 경계 x (우측 구역 시작)
+    :param patch_size: 패치 한 변 길이
+    :param similarity_threshold: 유사도 기준 (0~1)
+    :return: (is_tripartite_verified, detail_str)
+    """
+    h, w = frame_gray.shape
+    w_l = peak_l_idx
+    w_c = peak_r_idx - peak_l_idx
+    w_r = w - peak_r_idx
+    if w_l < 10 or w_c < 10 or w_r < 10:
+        return False, "section too narrow"
+
+    # 상·중·하 y 중심, 좌/중/우 구역 내 x 상대 위치 (0.25, 0.5, 0.75)
+    y_centers = [h // 4, h // 2, (3 * h) // 4]
+    x_ratios = [0.25, 0.5, 0.75]
+    ps = min(
+        patch_size,
+        w_l // 3,
+        w_c // 3,
+        w_r // 3,
+        h // 4,
+        50,
+    )
+    ps = max(10, ps)
+
+    for row, yc in enumerate(y_centers):
+        for col, x_ratio in enumerate(x_ratios):
+            # 각 구역에서 같은 상대 위치의 패치 중심
+            x_l = int(w_l * x_ratio)
+            x_c = peak_l_idx + int(w_c * x_ratio)
+            x_r = peak_r_idx + int(w_r * x_ratio)
+            y0 = max(0, yc - ps // 2)
+            y1 = min(h, y0 + ps)
+
+            def extract(cx, x_start, x_end):
+                px0 = max(x_start, cx - ps // 2)
+                px1 = min(x_end, px0 + ps)
+                if px1 <= px0 or px1 - px0 < 5:
+                    return None
+                return frame_gray[y0:y1, px0:px1]
+
+            pl = extract(x_l, 0, peak_l_idx)
+            pc = extract(x_c, peak_l_idx, peak_r_idx)
+            pr = extract(x_r, peak_r_idx, w)
+            if pl is None or pc is None or pr is None:
+                continue
+            # 크기 맞춰서 비교 (최소 공통 크기)
+            min_h = min(pl.shape[0], pc.shape[0], pr.shape[0])
+            min_w = min(pl.shape[1], pc.shape[1], pr.shape[1])
+            if min_h < 5 or min_w < 5:
+                continue
+            pl = pl[:min_h, :min_w]
+            pc = pc[:min_h, :min_w]
+            pr = pr[:min_h, :min_w]
+
+            sim_lr = _patch_similarity(pl, pr)
+            sim_lc = _patch_similarity(pl, pc)
+            sim_cr = _patch_similarity(pc, pr)
+            # 좌==우 or 중==좌 or 중==우 중 하나만 만족하면 통과
+            if sim_lr >= similarity_threshold or sim_lc >= similarity_threshold or sim_cr >= similarity_threshold:
+                return True, f"patch row={row} col={col} (L-R={sim_lr:.2f} L-C={sim_lc:.2f} C-R={sim_cr:.2f})"
+
+    return False, "no patch pair passed (L-R or L-C or C-R)"
 
 
 def verify_left_right_duplicate(
@@ -251,10 +351,11 @@ def run_edge_check(
     search_range=40,
     threshold_mult=5.0,
     preset="orig",
+    verify_tripartite_duplicate=True,
     verify_bipartite_duplicate=True,
     duplicate_similarity_threshold=0.92,
 ):
-    """삼분할(w/3, 2w/3) → 불만족 시 이분할(중앙) 검사. 이분할은 좌/우 동일 영상 검증 통과 시에만 판정. 경계선 위치 출력 + debug/*_debug_edge.jpg 저장."""
+    """삼분할(w/3, 2w/3) → 불만족 시 이분할(중앙) 검사. 삼/이분할 모두 좌·중·우(또는 좌·우) 동일 영상 검증 통과 시에만 판정. 경계선 위치 출력 + debug/*_debug_edge.jpg 저장."""
     img = cv2.imread(image_path)
     if img is None:
         print(f"[오류] 이미지를 불러올 수 없습니다: {image_path}")
@@ -274,9 +375,15 @@ def run_edge_check(
     elif preset == "480":
         effective_threshold = min(threshold_mult, 3.5)
 
-    # 1. 삼분할(640/1280) 엣지 체크 + 소요 시간 측정
+    # 1. 삼분할(640/1280) 엣지 체크 + 선택적 좌·중·우 패치 검증
     t0 = time.perf_counter()
-    is_tri, p_l, p_r = fast_edge_check_v3(frame_gray, search_range, effective_threshold)
+    is_tri, p_l, p_r = fast_edge_check_v3(
+        frame_gray,
+        search_range,
+        effective_threshold,
+        verify_duplicate=verify_tripartite_duplicate,
+        duplicate_similarity_threshold=duplicate_similarity_threshold,
+    )
     elapsed_ms = (time.perf_counter() - t0) * 1000
 
     # 2. 삼분할 불만족 시 → 화면 절반(이분할) 경계선 체크
@@ -338,13 +445,17 @@ def run_edge_check(
     cv2.putText(debug_img, status_text, (50, h - 50),
                 cv2.FONT_HERSHEY_SIMPLEX, 1.2, line_color, 3)
 
-    # 저장: 이미지가 있는 폴더 안 debug/ 에 *_debug_edge.jpg 로 저장 (축소 시 파일명에 프리셋 포함)
+    # 저장: 이미지가 있는 폴더 안 debug/ 에 *_debug_edge.jpg 로 저장. 중복 시 _debug_edge_(1).jpg, _(2).jpg ... 넘버링
     img_dir = os.path.dirname(os.path.abspath(image_path))
     debug_dir = os.path.join(img_dir, "debug")
     os.makedirs(debug_dir, exist_ok=True)
     base_name = os.path.splitext(os.path.basename(image_path))[0]
-    suffix = f"_{preset}_debug_edge.jpg" if preset != "orig" else "_debug_edge.jpg"
-    out_path = os.path.join(debug_dir, base_name + suffix)
+    suffix_stem = f"_{preset}_debug_edge" if preset != "orig" else "_debug_edge"
+    out_path = os.path.join(debug_dir, base_name + suffix_stem + ".jpg")
+    n = 0
+    while os.path.exists(out_path):
+        n += 1
+        out_path = os.path.join(debug_dir, base_name + suffix_stem + f"_({n}).jpg")
     cv2.imwrite(out_path, debug_img)
     if is_tri:
         print(f"📍 경계선 좌표 확인 완료: {p_l}px, {p_r}px (저장: {out_path})")
@@ -366,6 +477,11 @@ def main():
         help="입력 FHD 영상을 다운스케일할 가로 해상도 프리셋 (orig, 960, 640, 480)",
     )
     parser.add_argument(
+        "--no-verify-tripartite",
+        action="store_true",
+        help="삼분할 시 좌·중·우 패치 유사도 검증 생략",
+    )
+    parser.add_argument(
         "--no-verify-duplicate",
         action="store_true",
         help="이분할 시 좌/우 동일 영상 유사도 검증 생략 (중앙선만 보면 이분할로 판정)",
@@ -374,7 +490,7 @@ def main():
         "--duplicate-threshold",
         type=float,
         default=0.92,
-        help="좌/우 절반 유사도 기준 (0~1). 이 이상이면 동일 영상 복붙으로 인정 (기본: 0.92)",
+        help="삼/이분할 패치 유사도 기준 (0~1). 좌==우 or 중==좌 or 중==우 등 하나만 만족해도 통과 (기본: 0.92)",
     )
     args = parser.parse_args()
 
@@ -383,6 +499,7 @@ def main():
         search_range=args.search_range,
         threshold_mult=args.threshold,
         preset=args.preset,
+        verify_tripartite_duplicate=not args.no_verify_tripartite,
         verify_bipartite_duplicate=not args.no_verify_duplicate,
         duplicate_similarity_threshold=args.duplicate_threshold,
     )
