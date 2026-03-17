@@ -1828,12 +1828,15 @@ def main() -> None:
             print(f"시점: {format_ts(time_sec)}  →  {verdict_kr}")
             print(f"이유: {reason}")
             print(f"디버그 이미지 저장: {debug_dir}")
-            # --edge-fallback 시 해당 시점에서 엣지 삼분할/이분할 판정 후 경계선 디버그 이미지 추가 저장 (오탐 분석용)
+
+            # --edge-fallback 시 해당 시점에서 엣지 기반 삼분할/이분할 결과도 별도 이미지로 저장 (오탐 분석용)
             if getattr(args, "edge_fallback", False) and CV2_AVAILABLE:
                 try:
                     from test.edge_check_ver1_down_scale import (
                         fast_edge_check_bipartite,
                         fast_edge_check_v3,
+                        verify_left_center_right_tripartite,
+                        verify_left_right_duplicate,
                     )
                 except ImportError:
                     pass
@@ -1848,41 +1851,122 @@ def main() -> None:
                         threshold_mult = 4.5
                     else:
                         threshold_mult = 5.0
-                    is_tri, p_l, p_r = fast_edge_check_v3(
-                        frame_gray, 40, threshold_mult, time_sec=time_sec,
+
+                    h, w = frame.shape[:2]
+
+                    # 1) 엣지 기반 삼분할 전용 이미지 (w/3, 2w/3 경계 + 패치 검증 디테일)
+                    tri_img = frame.copy()
+                    is_tri_edge, p_l, p_r = fast_edge_check_v3(
+                        frame_gray,
+                        40,
+                        threshold_mult,
+                        time_sec=time_sec,
                         verify_duplicate=EDGE_VERIFY_TRIPARTITE_DUPLICATE,
                         duplicate_similarity_threshold=EDGE_DUPLICATE_SIMILARITY_THRESHOLD,
                     )
-                    is_bi, p_center = False, 0
-                    if not is_tri:
-                        is_bi, p_center = fast_edge_check_bipartite(
-                            frame_gray, 40, threshold_mult, time_sec=time_sec,
-                            verify_duplicate=EDGE_VERIFY_BIPARTITE_DUPLICATE,
-                            duplicate_similarity_threshold=EDGE_DUPLICATE_SIMILARITY_THRESHOLD,
+                    # 패치 유사도 디테일 (성공/실패 이유)
+                    if p_l is not None and p_r is not None and p_r > p_l:
+                        tri_verified, tri_detail = verify_left_center_right_tripartite(
+                            frame_gray,
+                            p_l,
+                            p_r,
+                            similarity_threshold=EDGE_DUPLICATE_SIMILARITY_THRESHOLD,
                         )
-                    debug_img = frame.copy()
-                    h, w = frame.shape[:2]
-                    if is_tri:
-                        line_color = (0, 255, 0)
-                        cv2.line(debug_img, (p_l, 0), (p_l, h), line_color, 3)
-                        cv2.putText(debug_img, f"L:{p_l}", (p_l + 5, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, line_color, 2)
-                        cv2.line(debug_img, (p_r, 0), (p_r, h), line_color, 3)
-                        cv2.putText(debug_img, f"R:{p_r}", (p_r + 5, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, line_color, 2)
-                        status_text = f"Edge: 3-split | Gap: {p_r - p_l}px"
-                    elif is_bi:
-                        line_color = (0, 255, 0)
-                        cv2.line(debug_img, (p_center, 0), (p_center, h), line_color, 3)
-                        cv2.putText(debug_img, f"C:{p_center}", (p_center + 5, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, line_color, 2)
-                        status_text = f"Edge: 2-split | Center: {p_center}px"
                     else:
-                        line_color = (0, 0, 255)
-                        cv2.line(debug_img, (p_l, 0), (p_l, h), line_color, 2)
-                        cv2.line(debug_img, (p_r, 0), (p_r, h), line_color, 2)
-                        status_text = "Edge: no split"
-                    cv2.putText(debug_img, status_text, (10, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.8, line_color, 2)
-                    edge_path = debug_dir / f"{debug_export_prefix}_edge.jpg"
-                    cv2.imwrite(str(edge_path), debug_img)
-                    print(f"엣지 디버그 이미지 저장: {edge_path}")
+                        tri_verified, tri_detail = False, "invalid peaks"
+
+                    if is_tri_edge:
+                        tri_color = (0, 255, 0)
+                        cv2.line(tri_img, (p_l, 0), (p_l, h), tri_color, 3)
+                        cv2.line(tri_img, (p_r, 0), (p_r, h), tri_color, 3)
+                        status_tri = f"Edge tripartite: OK | L={p_l}, R={p_r}, gap={p_r - p_l}px"
+                    else:
+                        tri_color = (0, 0, 255)
+                        cv2.line(tri_img, (p_l, 0), (p_l, h), tri_color, 2)
+                        cv2.line(tri_img, (p_r, 0), (p_r, h), tri_color, 2)
+                        status_tri = "Edge tripartite: NG"
+                    cv2.putText(
+                        tri_img,
+                        status_tri,
+                        (10, h - 40),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        tri_color,
+                        2,
+                    )
+                    # 두 번째 줄에 패치 검증 디테일
+                    cv2.putText(
+                        tri_img,
+                        f"detail: {tri_detail}",
+                        (10, h - 15),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        tri_color,
+                        2,
+                    )
+                    tri_path = debug_dir / f"{debug_export_prefix}_edge_tripartite.jpg"
+                    cv2.imwrite(str(tri_path), tri_img)
+                    print(f"엣지 삼분할 디버그 이미지 저장: {tri_path}")
+
+                    # 2) 엣지 기반 이분할 전용 이미지 (중앙 경계 + half/패치 디테일)
+                    bi_img = frame.copy()
+                    is_bi_edge, p_center = fast_edge_check_bipartite(
+                        frame_gray,
+                        40,
+                        threshold_mult,
+                        time_sec=time_sec,
+                        verify_duplicate=EDGE_VERIFY_BIPARTITE_DUPLICATE,
+                        duplicate_similarity_threshold=EDGE_DUPLICATE_SIMILARITY_THRESHOLD,
+                    )
+                    # half/패치 검증 디테일
+                    if p_center is not None:
+                        bi_verified, bi_detail = verify_left_right_duplicate(
+                            frame_gray,
+                            center=p_center,
+                            similarity_threshold=EDGE_DUPLICATE_SIMILARITY_THRESHOLD,
+                        )
+                    else:
+                        bi_verified, bi_detail = False, "invalid center"
+
+                    if is_bi_edge:
+                        bi_color = (0, 255, 0)
+                        cv2.line(bi_img, (p_center, 0), (p_center, h), bi_color, 3)
+                        cv2.putText(
+                            bi_img,
+                            f"C={p_center}",
+                            (p_center + 5, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6,
+                            bi_color,
+                            2,
+                        )
+                        status_bi = f"Edge bipartite: OK | center={p_center}px"
+                    else:
+                        bi_color = (0, 0, 255)
+                        center_guess = w // 2
+                        cv2.line(bi_img, (center_guess, 0), (center_guess, h), bi_color, 2)
+                        status_bi = "Edge bipartite: NG"
+                    cv2.putText(
+                        bi_img,
+                        status_bi,
+                        (10, h - 40),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        bi_color,
+                        2,
+                    )
+                    cv2.putText(
+                        bi_img,
+                        f"detail: {bi_detail}",
+                        (10, h - 15),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        bi_color,
+                        2,
+                    )
+                    bi_path = debug_dir / f"{debug_export_prefix}_edge_bipartite.jpg"
+                    cv2.imwrite(str(bi_path), bi_img)
+                    print(f"엣지 이분할 디버그 이미지 저장: {bi_path}")
             return
 
         # --segments-in: 파일에서 구간 목록 읽어서 출력·병합만 (검출 생략)

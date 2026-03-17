@@ -286,6 +286,21 @@ def fast_edge_check_bipartite(
     h, w = frame_gray.shape
     center = w // 2  # 1920이면 960
 
+    # 0. 좌/우 절반이 충분히 비슷하면 엣지 강도와 무관하게 이분할로 먼저 판정
+    #    (엣지 검출은 보조 정보로 사용)
+    if verify_duplicate:
+        is_dup_first, detail_first = verify_left_right_duplicate(
+            frame_gray,
+            center=center,
+            similarity_threshold=duplicate_similarity_threshold,
+        )
+        if is_dup_first:
+            # 엣지 검출 없이 중앙 index는 이론상 center로 반환
+            print(
+                f"{_edge_log_prefix(time_sec)}이분할 탐지: 위치 {center}px (중앙 {center} 부근) (검증: {detail_first}, edge check skipped)"
+            )
+            return True, center
+
     blurred = cv2.GaussianBlur(frame_gray, (3, 3), 0)
     sobel_x = cv2.Sobel(blurred, cv2.CV_64F, 1, 0, ksize=3)
     sobel_x = np.abs(sobel_x)
