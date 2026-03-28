@@ -4,12 +4,14 @@ Ctrl+C 시 현재 파일만 중단하며, 완료 목록(done)에는 반영하지
 이번 실행에서 이미 기록된 완료 파일 목록·누적 개수·상태 파일 경로를 출력합니다.
 exit code 0일 때만 해당 파일을 기록합니다.
 같은 폴더에 <입력파일stem>_merged.mp4 가 있으면 완료로 보고 해당 .ts 는 스킵합니다.
+파일명에 merged 가 포함된 .ts(예: …-cut-merged-….ts)는 산출물로 보고 스킵합니다(대소문자 무시).
 
 사용 예 (스캔 폴더는 --scan-dir 로 지정; positional + REMAINDER 를 같이 쓰면 --state 등이
   하위 스크립트로 넘어가 버리므로 이렇게 호출해야 함):
   python tripartite_batch_queue.py --scan-dir "E:\\ffmpeg" ^
     --state "E:\\ffmpeg\\tripartite_done.txt" ^
     --glob "m0m099_*.ts" ^
+    --since-date 20240702 ^
     -- --workers 4 --coarse-interval 30 --coarse-scale 640 ^
        --merge-workers 4 --merge-notify all --segments-out --merge --edge-fallback
 
@@ -19,9 +21,33 @@ exit code 0일 때만 해당 파일을 기록합니다.
 from __future__ import annotations
 
 import argparse
+import re
 import subprocess
 import sys
+from datetime import date
 from pathlib import Path
+
+# 파일명 안의 m0m099_20240702_220400… 처럼 _YYYYMMDD_ 토큰에서 날짜 추출
+_DATE_IN_NAME = re.compile(r"_(\d{8})_")
+
+
+def parse_since_date_arg(value: str) -> date:
+    """YYYYMMDD 또는 ISO(2024-07-02) 형식."""
+    s = value.strip()
+    if re.fullmatch(r"\d{8}", s):
+        return date(int(s[:4]), int(s[4:6]), int(s[6:8]))
+    return date.fromisoformat(s)
+
+
+def embedded_date_in_ts_name(path: Path) -> date | None:
+    m = _DATE_IN_NAME.search(path.name)
+    if not m:
+        return None
+    d = m.group(1)
+    try:
+        return date(int(d[:4]), int(d[4:6]), int(d[6:8]))
+    except ValueError:
+        return None
 
 
 def _norm_key(p: Path) -> str:
@@ -62,6 +88,11 @@ def merged_output_path(ts: Path) -> Path:
 
 def has_merged_output(ts: Path) -> bool:
     return merged_output_path(ts).is_file()
+
+
+def ts_name_contains_merged(path: Path) -> bool:
+    """파일명에 merged 포함 시 True (이미 병합·후처리 산출물로 간주, 대소문자 무시)."""
+    return "merged" in path.name.lower()
 
 
 def run_one(
@@ -127,6 +158,14 @@ def main() -> None:
         help="한 파일이라도 실패(exit!=0)하면 큐 중단",
     )
     parser.add_argument(
+        "--since-date",
+        type=parse_since_date_arg,
+        default=None,
+        metavar="DATE",
+        help="파일명 속 _YYYYMMDD_ 기준으로, 해당 날짜 이후(당일 포함)만 큐에 넣음. "
+        "형식: 20240702 또는 2024-07-02. 이름에서 날짜를 못 읽으면 필터에서 제외하지 않음",
+    )
+    parser.add_argument(
         "tripartite_args",
         nargs=argparse.REMAINDER,
         help="tripartite_section_check.py 인자 (-- 로 구분)",
@@ -143,13 +182,37 @@ def main() -> None:
         raise SystemExit(f"스크립트 없음: {args.script}")
 
     done = load_done(state_path)
-    candidates = list_candidates(scan_dir, args.glob_pat)
+    raw_list = list_candidates(scan_dir, args.glob_pat)
+    since = args.since_date
+    if since is not None:
+        after_date = []
+        for p in raw_list:
+            emb = embedded_date_in_ts_name(p)
+            if emb is None or emb >= since:
+                after_date.append(p)
+        date_excluded = len(raw_list) - len(after_date)
+    else:
+        after_date = raw_list
+        date_excluded = 0
+
+    candidates = [p for p in after_date if not ts_name_contains_merged(p)]
+    name_merged_excluded = len(after_date) - len(candidates)
+
     in_done = {p for p in candidates if _norm_key(p) in done}
     merged_skip = {p for p in candidates if p not in in_done and has_merged_output(p)}
     pending = [p for p in candidates if p not in in_done and p not in merged_skip]
 
+    date_line = ""
+    if since is not None:
+        date_line = (
+            f"날짜 필터: --since-date {since.isoformat()} "
+            f"(glob 일치 {len(raw_list)}개 → 이후·파싱불가 포함 {len(after_date)}개, "
+            f"이전만 제외 {date_excluded}개)\n"
+        )
     print(
         f"스캔: {scan_dir}  패턴: {args.glob_pat!r}\n"
+        f"{date_line}"
+        f"파일명에 merged 포함 제외: {name_merged_excluded}개\n"
         f"후보 {len(candidates)}개, 상태파일 완료 {len(in_done)}개, "
         f"_merged.mp4 있어 스킵 {len(merged_skip)}개, 남음 {len(pending)}개\n"
         f"상태 파일: {state_path}\n",
