@@ -47,8 +47,8 @@ except ImportError:
 # 탐색: 코스 스캔 → 경계 구간만 이진 탐색 (3~6시간 영상에 효율적)
 COARSE_INTERVAL = 30.0  # 코스 스캔 간격(초). 30초면 6시간에 약 720회 샘플
 BOUNDARY_TOLERANCE = 0.9375  # 경계 이진 탐색 정밀도(초). 기본 0.9375초(속도·정확도 균형). CLI --boundary-tolerance로 변경 가능
-Y_CROP_RATIO_START = 0.4  # 높이 상 35% 지점부터 샘플 (상단 팝업 제외)
-Y_CROP_RATIO_END = 0.5  # 높이 상 65% 지점까지 샘플 (중앙부만 사용)
+Y_CROP_RATIO_START = 0.25  # 높이 상 35% 지점부터 샘플 (상단 팝업 제외)
+Y_CROP_RATIO_END = 0.3  # 높이 상 65% 지점까지 샘플 (중앙부만 사용)
 MSE_THRESHOLD = 500.0  # 이 값 이하면 좌=우 동일으로 간주 (튜닝 가능)
 # 송출자가 가상선을 640/1280 대신 647/1273 등으로 그린 경우 대비: 경계를 ±N픽셀 옮겨 보며 MSE 최소인 정렬 탐색
 ALIGN_TOLERANCE_PX = 5  # 0이면 고정 1/3·2/3만 사용, 10이면 w/3±10 픽셀 범위에서 최적 좌/우 너비 탐색
@@ -1456,14 +1456,38 @@ def _merge_notify(mode: str, output_path: Path, n_segments: int) -> None:
             pass
 
 
+def _merge_stem_from_original_stem(stem: str, merged_label: str) -> str:
+    """
+    stem이 ID_YYYYMMDD_NNNNNN_나머지 형태(언더스코어 구분, 2번째 8자리 숫자=날짜, 3번째 6자리 숫자)이면
+    네 번째 토큰 자리에 merged_label을 끼워 넣는다. 아니면 stem_merged_label.
+    """
+    parts = stem.split("_")
+    if len(parts) >= 4:
+        date_part, rand_part = parts[1], parts[2]
+        if (
+            len(date_part) == 8
+            and date_part.isdigit()
+            and len(rand_part) == 6
+            and rand_part.isdigit()
+        ):
+            return "_".join(parts[:3] + [merged_label] + parts[3:])
+    return f"{stem}_{merged_label}"
+
+
 def _merge_output_path_for_input(input_path: Path) -> Path:
-    """기본 병합 파일명(원본_merged.mp4). 이미 존재하면 _merged(1).mp4, _merged(2).mp4 ... 중 존재하지 않는 이름 반환."""
-    base = input_path.parent / (input_path.stem + "_merged.mp4")
+    """
+    기본 병합 파일명: 패턴에 맞으면 ID_날짜_랜덤6자리_merged_나머지.mp4,
+    아니면 원본stem_merged.mp4. 이미 존재하면 merged → merged(1), merged(2) ...
+    """
+    ext = ".mp4"
+    stem_merged = _merge_stem_from_original_stem(input_path.stem, "merged")
+    base = input_path.parent / (stem_merged + ext)
     if not base.exists():
         return base
     n = 1
     while True:
-        candidate = input_path.parent / (input_path.stem + f"_merged({n}).mp4")
+        stem_n = _merge_stem_from_original_stem(input_path.stem, f"merged({n})")
+        candidate = input_path.parent / (stem_n + ext)
         if not candidate.exists():
             return candidate
         n += 1
@@ -1788,7 +1812,7 @@ def main() -> None:
         const=True,
         default=None,
         metavar="OUTPUT",
-        help="검출된 구간만 코덱 카피로 잘라서 한 파일로 이어붙여 저장. 인자 없으면 원본과 같은 폴더에 원본파일명_merged.mp4 로 저장. 경로/파일명을 주면 그 위치에 저장. 예: --merge 또는 --merge F:\\세경\\result.mp4",
+        help="검출된 구간만 코덱 카피로 잘라서 한 파일로 이어붙여 저장. 인자 없으면 원본과 같은 폴더에 저장: 파일명이 ID_YYYYMMDD_6자리숫자_... 형태면 네 번째 토큰 위치에 merged를 끼운 이름.mp4, 아니면 원본stem_merged.mp4. 경로/파일명을 주면 그 위치에 저장. 예: --merge 또는 --merge F:\\세경\\result.mp4",
     )
     parser.add_argument(
         "--merge-workers",
