@@ -1,0 +1,2194 @@
+"""
+삼분할(Tripartite) 구간 검출기.
+
+FHD 영상에서 "화면 정중앙 1/3을 양옆으로 복제한" 구간을 찾아
+시작·종료 타임스탬프를 로그로 출력합니다.
+상단 팝업을 피하기 위해 높이(y) 중앙부만 샘플하여 비교합니다.
+
+사용: python tripartite_section_check.py input.ts [--workers N] [--cuda]
+      한 시점만 판정: python tripartite_section_check.py input.ts --debug-frame 00:45:10.312 [--debug-scale 640]
+필수: ffmpeg, ffprobe (PATH)
+패키지: pip install -r requirements_tripartite.txt  (opencv-python, numpy; GPU 시 cupy-cuda12x 등)
+자원: 기본 CPU. --cuda 시 ffmpeg GPU 디코딩 + (CuPy 있으면) 판정 연산 GPU.
+"""
+
+import argparse
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from concurrent.futures import ProcessPoolExecutor
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+from split_detector import SplitDetectorConfig, detect_split_frame, render_debug_overlay
+
+# --verify-export 시 이미지 저장용. 없으면 해당 옵션 사용 시 안내만 출력.
+try:
+    import cv2
+    CV2_AVAILABLE = True
+except ImportError:
+    cv2 = None  # type: ignore[assignment]
+    CV2_AVAILABLE = False
+
+# GPU 판정 연산용 CuPy (선택). 없으면 --cuda 시에도 판정은 CPU.
+try:
+    import cupy as cp
+    CUPY_AVAILABLE = True
+except ImportError:
+    cp = None
+    CUPY_AVAILABLE = False
+
+
+# --- 설정 (필요 시 조정) ---
+# 탐색: 코스 스캔 → 경계 구간만 이진 탐색 (3~6시간 영상에 효율적)
+COARSE_INTERVAL = 30.0  # 코스 스캔 간격(초). 30초면 6시간에 약 720회 샘플
+BOUNDARY_TOLERANCE = 0.9375  # 경계 이진 탐색 정밀도(초). 기본 0.9375초(속도·정확도 균형). CLI --boundary-tolerance로 변경 가능
+Y_CROP_RATIO_START = 0  # 높이 상 35% 지점부터 샘플 (상단 팝업 제외)
+Y_CROP_RATIO_END = 1.0  # 높이 상 65% 지점까지 샘플 (중앙부만 사용)
+MSE_THRESHOLD = 500.0  # 이 값 이하면 좌=우 동일으로 간주 (튜닝 가능)
+# 송출자가 가상선을 640/1280 대신 647/1273 등으로 그린 경우 대비: 경계를 ±N픽셀 옮겨 보며 MSE 최소인 정렬 탐색
+ALIGN_TOLERANCE_PX = 5  # 0이면 고정 1/3·2/3만 사용, 10이면 w/3±10 픽셀 범위에서 최적 좌/우 너비 탐색
+MIN_SEGMENT_DURATION = 20.0  # 최소 구간 길이(초), 이보다 짧으면 구간으로 인정 안 함(선택)
+MERGE_GAP_SECONDS = 30.0  # 연속 구간의 끝~다음 시작이 이 시간(초) 이내면 하나로 병합
+# 병합 시 임시 폴더: 사용자 Videos 아래 전용 폴더 사용(로컬/NVMe 체감용). 실행마다 그 안에 merge_xxx 생성 후 삭제.
+MERGE_TMP_BASE = Path.home() / "Videos" / "tripartite_merge_tmp"
+# MSE 삼분할 판정: 비교할 구역 쌍. lr=좌·우, lc=좌·중, cr=중·우, lc_rc=좌·중·과·중·우 모두(구 strict).
+COMPARE_MODE_DEFAULT = "lr"
+VALID_COMPARE_MODES = ("lr", "lc", "cr", "lc_rc")
+# 코스 스캔 병렬화: 0이면 순차, 1 이상이면 해당 수만큼 프로세스 사용 (논리 코어까지 활용 가능)
+DEFAULT_WORKERS = os.cpu_count() or 8
+
+# 실행 로그 저장: cwd/logs/*.txt (main에서 Tee로 stdout/stderr 동시 기록)
+LOG_DIR = Path.cwd() / "logs"
+
+DETECTED_LABELS = {"2-split", "3-split"}
+SPLIT_CFG = SplitDetectorConfig()
+
+
+def _is_detected_label(label: str) -> bool:
+    return label in DETECTED_LABELS
+
+
+def _log_detection_result(prefix: str, t_sec: float, result: dict) -> None:
+    label = str(result.get("label", "single"))
+    boundaries = result.get("boundaries", [])
+    peak_x = result.get("peak_x", [])
+    raw_peak_x = result.get("raw_peak_x", [])
+    reason = str(result.get("reason", ""))
+    print(
+        f"{prefix} {format_ts(t_sec)} | label={label} | boundaries={boundaries} | peaks={peak_x} | raw_peaks={raw_peak_x} | reason={reason}",
+        flush=True,
+    )
+
+
+class _Tee:
+    """stdout/stderr를 원래 스트림과 파일에 동시에 쓰기 (로그 저장용)."""
+
+    def __init__(self, stream, file):
+        self._stream = stream
+        self._file = file
+
+    def write(self, s: str) -> None:
+        self._stream.write(s)
+        self._stream.flush()
+        if s:
+            self._file.write(s)
+            self._file.flush()
+
+    def flush(self) -> None:
+        self._stream.flush()
+        self._file.flush()
+
+    def writable(self) -> bool:
+        return True
+
+
+def get_video_info(path: Path) -> tuple[float, int, int]:
+    """ffprobe로 영상 길이(초)와 너비, 높이를 반환."""
+    duration_cmd = [
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", str(path),
+    ]
+    size_cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=width,height", "-of", "csv=p=0", str(path),
+    ]
+    try:
+        out_d = subprocess.run(duration_cmd, capture_output=True, text=True, check=True, timeout=10)
+        out_s = subprocess.run(size_cmd, capture_output=True, text=True, check=True, timeout=10)
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        raise RuntimeError(f"ffprobe 실행 실패 (ffprobe가 PATH에 있는지 확인): {e}") from e
+
+    duration = float(out_d.stdout.strip())
+    # ffprobe 출력에 줄바꿈/여러 스트림이 섞일 수 있음 → 쉼표·줄바꿈 모두 구분해 첫 두 숫자만 사용
+    raw = out_s.stdout.strip().replace("\n", ",")
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if len(parts) < 2:
+        raise RuntimeError(f"ffprobe 해상도 파싱 실패: {out_s.stdout!r}")
+    width, height = int(parts[0]), int(parts[1])
+    return duration, width, height
+
+
+def _get_keyframe_times_from_file(path: Path, timeout: int = 120) -> list[float]:
+    """
+    단일 파일(보통 작은 조각)에서 키프레임 PTS(초) 목록 반환.
+    packet 방식 → 0개면 frame 방식 폴백. 로컬 작은 파일용.
+    """
+    path_str = str(path)
+    # 1) packet=pts_time,flags
+    cmd_p = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "packet=pts_time,flags", "-of", "csv=p=0", path_str,
+    ]
+    try:
+        out = subprocess.run(cmd_p, capture_output=True, text=True, check=True, timeout=timeout)
+        times = []
+        for line in out.stdout.strip().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(",", 1)
+            if len(parts) < 2 or "K" not in parts[1]:
+                continue
+            try:
+                times.append(float(parts[0]))
+            except ValueError:
+                continue
+        if times:
+            return sorted(times)
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    # 2) frame=key_frame,pkt_pts_time
+    cmd_f = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "frame=key_frame,pkt_pts_time", "-of", "csv=p=0", path_str,
+    ]
+    try:
+        out = subprocess.run(cmd_f, capture_output=True, text=True, check=True, timeout=timeout)
+        times = []
+        for line in out.stdout.strip().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(",", 1)
+            if len(parts) < 2:
+                continue
+            if parts[0] != "1":
+                continue
+            try:
+                times.append(float(parts[1]))
+            except ValueError:
+                continue
+        return sorted(times)
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+
+
+def extract_frame(
+    path: Path,
+    time_sec: float,
+    width: int,
+    height: int,
+    use_gpu: bool = False,
+    scale_width: int | None = None,
+) -> np.ndarray | None:
+    """지정 시점의 1프레임을 BGR numpy 배열로 반환. use_gpu=True 시 ffmpeg CUDA 디코딩. 실패 시 None.
+    scale_width가 지정되면 해당 폭으로 리사이즈 후 반환(코스 스캔 저해상도용). 비율 유지해 높이 계산."""
+    out_w = scale_width if scale_width is not None else width
+    out_h = round(height * out_w / width) if scale_width is not None else height
+    base = ["-ss", str(time_sec), "-i", str(path)]
+    scale_filters = ["-vf", f"scale={out_w}:-1"] if scale_width is not None else []
+    tail = ["-vframes", "1", "-f", "rawvideo", "-pix_fmt", "bgr24", "-an", "-sn", "pipe:1"]
+
+    cmd = ["ffmpeg", "-y"]
+    if use_gpu:
+        cmd.extend(["-hwaccel", "cuda"])
+    cmd.extend(base + scale_filters + tail)
+    try:
+        out = subprocess.run(cmd, capture_output=True, timeout=15)
+        if out.returncode != 0 or not out.stdout:
+            if use_gpu:
+                cmd_cpu = ["ffmpeg", "-y"] + base + scale_filters + tail
+                out = subprocess.run(cmd_cpu, capture_output=True, timeout=15)
+            if out.returncode != 0 or not out.stdout:
+                return None
+        frame = np.frombuffer(out.stdout, dtype=np.uint8).reshape((out_h, out_w, 3))
+        return frame
+    except (subprocess.TimeoutExpired, ValueError, FileNotFoundError):
+        return None
+
+
+def crop_middle_y(frame: np.ndarray) -> np.ndarray:
+    """높이(y) 중앙부만 잘라 반환. 상단 팝업 제외."""
+    h, w = frame.shape[:2]
+    y0 = int(h * Y_CROP_RATIO_START)
+    y1 = int(h * Y_CROP_RATIO_END)
+    return frame[y0:y1, :].copy()
+
+
+def split_third(region: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """세로로 3등분해 왼쪽, 중앙, 오른쪽 영역 반환."""
+    w = region.shape[1]
+    third = w // 3
+    left = region[:, :third]
+    center = region[:, third : 2 * third]
+    right = region[:, 2 * third :]
+    return left, center, right
+
+
+def split_third_with_left_width(
+    region: np.ndarray, left_width: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """좌/우 너비를 left_width로 해서 왼쪽·중앙·오른쪽 영역 반환. (정렬 허용 시 사용)"""
+    w = region.shape[1]
+    left = region[:, :left_width]
+    center = region[:, left_width : w - left_width]
+    right = region[:, w - left_width :]
+    return left, center, right
+
+
+def mse(a: np.ndarray, b: np.ndarray) -> float:
+    """Mean Squared Error. 두 영역 크기가 같아야 함."""
+    if a.shape != b.shape:
+        return float("inf")
+    return float(np.mean((a.astype(np.float64) - b.astype(np.float64)) ** 2))
+
+
+def _tripartite_passes(mse_lr: float, mse_lc: float, mse_rc: float, compare_mode: str) -> bool:
+    """compare_mode에 따라 삼분할 MSE 통과 여부."""
+    if compare_mode == "lr":
+        return mse_lr <= MSE_THRESHOLD
+    if compare_mode == "lc":
+        return mse_lc <= MSE_THRESHOLD
+    if compare_mode == "cr":
+        return mse_rc <= MSE_THRESHOLD
+    if compare_mode == "lc_rc":
+        return mse_lc <= MSE_THRESHOLD and mse_rc <= MSE_THRESHOLD
+    return mse_lr <= MSE_THRESHOLD
+
+
+def _tripartite_optim_score(mse_lr: float, mse_lc: float, mse_rc: float, compare_mode: str) -> float:
+    """경계 L 탐색 시 최소화할 스칼라 (낮을수록 좋음)."""
+    if compare_mode == "lr":
+        return mse_lr
+    if compare_mode == "lc":
+        return mse_lc
+    if compare_mode == "cr":
+        return mse_rc
+    if compare_mode == "lc_rc":
+        return max(mse_lc, mse_rc)
+    return mse_lr
+
+
+def _compare_mode_label_kr(compare_mode: str) -> str:
+    return {
+        "lr": "좌·우만 비교 (중앙 무시)",
+        "lc": "좌·중 비교",
+        "cr": "중·우 비교",
+        "lc_rc": "좌·중 및 중·우 모두 비교 (strict)",
+    }.get(compare_mode, compare_mode)
+
+
+def _primary_mse_for_display(mse_dict: dict[str, float], compare_mode: str) -> float:
+    if compare_mode == "lr":
+        return float(mse_dict.get("left_right", 0.0))
+    if compare_mode == "lc":
+        return float(mse_dict.get("left_center", 0.0))
+    if compare_mode == "cr":
+        return float(mse_dict.get("right_center", 0.0))
+    if compare_mode == "lc_rc":
+        return max(float(mse_dict.get("left_center", 0.0)), float(mse_dict.get("right_center", 0.0)))
+    return float(mse_dict.get("left_right", 0.0))
+
+
+def _is_tripartite_frame_gpu(
+    frame: np.ndarray, compare_mode: str, align_tolerance_px: int | None = None
+) -> bool:
+    """CuPy로 crop/split/MSE를 GPU에서 수행 (use_gpu 시 호출)."""
+    if not CUPY_AVAILABLE:
+        return _is_tripartite_frame_cpu(frame, compare_mode, align_tolerance_px)
+    h, w = frame.shape[:2]
+    y0 = int(h * Y_CROP_RATIO_START)
+    y1 = int(h * Y_CROP_RATIO_END)
+    g = cp.asarray(frame[y0:y1, :])
+    crop_w = g.shape[1]
+    base = crop_w // 3
+    tol = align_tolerance_px if align_tolerance_px is not None else ALIGN_TOLERANCE_PX
+    if tol <= 0:
+        L_vals = [base]
+    else:
+        L_vals = range(
+            max(1, base - tol),
+            min(crop_w // 2, base + tol + 1),
+        )
+    for L in L_vals:
+        if crop_w - L < 1:
+            continue
+        left = g[:, :L].astype(cp.float64)
+        right = g[:, crop_w - L :].astype(cp.float64)
+        center = g[:, L : crop_w - L].astype(cp.float64)
+        min_c = min(left.shape[1], center.shape[1], right.shape[1])
+        if min_c < 1:
+            continue
+        lc = left[:, :min_c]
+        cc = center[:, :min_c]
+        rc = right[:, :min_c]
+        mse_lr = float(cp.mean((left - right) ** 2).item()) if left.shape == right.shape else float("inf")
+        mse_lc = float(cp.mean((lc - cc) ** 2).item())
+        mse_rc = float(cp.mean((rc - cc) ** 2).item())
+        if _tripartite_passes(mse_lr, mse_lc, mse_rc, compare_mode):
+            return True
+    return False
+
+
+def _is_tripartite_frame_cpu(
+    frame: np.ndarray, compare_mode: str, align_tolerance_px: int | None = None
+) -> bool:
+    """CPU(NumPy) 경로. ALIGN_TOLERANCE_PX > 0이면 경계를 ±N픽셀 옮겨 보며 최적 정렬 탐색."""
+    cropped = crop_middle_y(frame)
+    w = cropped.shape[1]
+    base = w // 3
+    tol = align_tolerance_px if align_tolerance_px is not None else ALIGN_TOLERANCE_PX
+    if tol <= 0:
+        L_vals = [base]
+    else:
+        L_vals = range(max(1, base - tol), min(w // 2, base + tol + 1))
+    for L in L_vals:
+        if w - L < 1:
+            continue
+        left, center, right = split_third_with_left_width(cropped, L)
+        min_w = min(left.shape[1], center.shape[1], right.shape[1])
+        if min_w < 1:
+            continue
+        left = left[:, :min_w]
+        center = center[:, :min_w]
+        right = right[:, :min_w]
+        mse_lr = mse(left, right)
+        mse_lc = mse(left, center)
+        mse_rc = mse(right, center)
+        if _tripartite_passes(mse_lr, mse_lc, mse_rc, compare_mode):
+            return True
+    return False
+
+
+def is_tripartite_frame(
+    frame: np.ndarray,
+    compare_mode: str = COMPARE_MODE_DEFAULT,
+    use_gpu: bool = False,
+    align_tolerance_px: int | None = None,
+) -> bool:
+    del compare_mode, use_gpu, align_tolerance_px
+    result = detect_split_frame(frame, SPLIT_CFG)
+    return _is_detected_label(str(result.get("label", "single")))
+
+
+def get_tripartite_mse(
+    frame: np.ndarray,
+    compare_mode: str = COMPARE_MODE_DEFAULT,
+    use_gpu: bool = False,
+    align_tolerance_px: int | None = None,
+) -> tuple[bool, dict[str, float]]:
+    del compare_mode, use_gpu, align_tolerance_px
+    result = detect_split_frame(frame, SPLIT_CFG)
+    label = str(result.get("label", "single"))
+    ok = _is_detected_label(label)
+    info = {
+        "label": label,
+        "detected": float(1.0 if ok else 0.0),
+        "boundary_count": float(len(result.get("boundaries", []))),
+        "peak_count": float(len(result.get("peak_x", []))),
+    }
+    return ok, info  # type: ignore[return-value]
+
+
+# ========== Edge-based fallback (선택 사항) ==========
+# --edge-fallback 시 처리 순서: 삼분할(MSE) → 실패 시 신규 삼분할(엣지) → 실패 시 이분할(엣지).
+# 이분할까지 감지되면 해당 시점도 구간에 포함되며, 인접 시 삼분할 구간과 하나로 합쳐짐(검출된 구간).
+# 엣지 검출 후 test/edge_check_ver1_down_scale과 동일하게 좌·중·우(또는 좌·우) 패치 유사도 검증 적용.
+EDGE_VERIFY_TRIPARTITE_DUPLICATE = True  # 삼분할 시 좌·중·우 9패치 유사도 검증
+EDGE_VERIFY_BIPARTITE_DUPLICATE = True   # 이분할 시 좌/우 절반·패치 유사도 검증
+EDGE_DUPLICATE_SIMILARITY_THRESHOLD = 0.92  # 유사도 기준 (0~1). 이 이상이면 동일 영상 복붙으로 인정
+
+# 제거 시: 아래 함수 삭제, _coarse_worker/순차 분기/_check_tripartite_at 내 fallback 호출 제거,
+# find_segments·_boundary_worker·main 의 use_edge_fallback 관련 인자/CLI 제거.
+def _edge_fallback_detect(
+    frame_bgr: np.ndarray,
+    scale_width: int,
+    search_range: int = 40,
+    time_sec: float | None = None,
+    verify_tripartite_duplicate: bool | None = None,
+    verify_bipartite_duplicate: bool | None = None,
+    duplicate_similarity_threshold: float | None = None,
+) -> tuple[bool, bool]:
+    """
+    엣지 기반 삼분할 → 이분할 순서로 판정 (test/edge_check_ver1_down_scale 알고리즘).
+    호출 조건: 메인(MSE) 삼분할이 실패한 경우에만 사용.
+    처리 순서: 1) 엣지 삼분할(fast_edge_check_v3) 2) 실패 시 엣지 이분할(fast_edge_check_bipartite).
+    삼분할: 경계선 검출 후 verify_tripartite_duplicate이 True면 좌·중·우 9패치 유사도 검증.
+    이분할: 중앙선 검출 후 verify_bipartite_duplicate이 True면 좌/우 절반·패치 유사도 검증.
+    frame_bgr은 BGR, scale_width는 코스 스캔 폭(640 등). time_sec이 있으면 로그에 시각 출력.
+    반환: (is_tripartite, is_bipartite).
+    """
+    if not CV2_AVAILABLE or frame_bgr is None or frame_bgr.ndim != 3:
+        return (False, False)
+    if verify_tripartite_duplicate is None:
+        verify_tripartite_duplicate = EDGE_VERIFY_TRIPARTITE_DUPLICATE
+    if verify_bipartite_duplicate is None:
+        verify_bipartite_duplicate = EDGE_VERIFY_BIPARTITE_DUPLICATE
+    if duplicate_similarity_threshold is None:
+        duplicate_similarity_threshold = EDGE_DUPLICATE_SIMILARITY_THRESHOLD
+    try:
+        from test.edge_check_ver1_down_scale import (
+            fast_edge_check_bipartite,
+            fast_edge_check_v3,
+        )
+    except ImportError:
+        return (False, False)
+    frame_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    # 다운스케일 프리셋에 따른 threshold (edge_check_ver1_down_scale과 동일)
+    if scale_width <= 480:
+        threshold_mult = 3.5
+    elif scale_width <= 640:
+        threshold_mult = 4.0
+    elif scale_width <= 960:
+        threshold_mult = 4.5
+    else:
+        threshold_mult = 5.0
+    is_tri, _, _ = fast_edge_check_v3(
+        frame_gray,
+        search_range=search_range,
+        threshold_mult=threshold_mult,
+        time_sec=time_sec,
+        verify_duplicate=verify_tripartite_duplicate,
+        duplicate_similarity_threshold=duplicate_similarity_threshold,
+    )
+    is_bi = False
+    if not is_tri:
+        is_bi, _ = fast_edge_check_bipartite(
+            frame_gray,
+            search_range=search_range,
+            threshold_mult=threshold_mult,
+            time_sec=time_sec,
+            verify_duplicate=verify_bipartite_duplicate,
+            duplicate_similarity_threshold=duplicate_similarity_threshold,
+        )
+    return (is_tri, is_bi)
+
+
+def format_ts(sec: float) -> str:
+    """초 단위 시간을 HH:MM:SS.mmm 형식으로."""
+    h = int(sec // 3600)
+    m = int((sec % 3600) // 60)
+    s = sec % 60
+    return f"{h:02d}:{m:02d}:{s:06.3f}"
+
+
+def _ts_to_export_fname(sec: float) -> str:
+    """타임스탬프를 export 파일명에 쓸 수 있는 문자열로 (콜론 제거)."""
+    return format_ts(sec).replace(":", "-")
+
+
+def _export_verify_frames(
+    frame: np.ndarray,
+    t_sec: float,
+    ok: bool,
+    mse_dict: dict[str, float],
+    compare_mode: str,
+    export_dir: Path,
+    export_prefix: str | None = None,
+) -> bool:
+    """
+    검증용: 프로그램이 보는 영역(크롭)과 좌/중/우 구간 이미지를 저장.
+    export_prefix가 있으면 파일명이 {export_prefix}_crop.png, {export_prefix}_lcr_OK.png 등.
+    반환: 두 장 모두 성공 시 True, 하나라도 실패 시 False.
+    """
+    if not CV2_AVAILABLE:
+        return False
+    export_dir = export_dir.resolve()
+
+    def _save_png(path: Path, img: np.ndarray) -> bool:
+        """cv2.imencode + Path.write_bytes 로 저장 (한글 경로 등 Windows Unicode 호환)."""
+        ret, buf = cv2.imencode(".png", img)
+        if not ret or buf is None:
+            return False
+        try:
+            path.write_bytes(buf.tobytes())
+            return True
+        except OSError:
+            return False
+
+    crop = crop_middle_y(frame)
+    best_L = mse_dict.get("best_L")
+    if best_L is not None:
+        left, center, right = split_third_with_left_width(crop, int(round(best_L)))
+    else:
+        left, center, right = split_third(crop)
+    fname = _ts_to_export_fname(t_sec)
+    # 1) 크롭 영역 저장 (프로그램이 보는 영역)
+    if export_prefix is not None:
+        crop_path = export_dir / f"{export_prefix}_crop.png"
+    else:
+        crop_path = export_dir / f"crop_{fname}.png"
+    ok1 = _save_png(crop_path, crop)
+    if not ok1:
+        print(f"[경고] 이미지 저장 실패: {crop_path}", file=sys.stderr, flush=True)
+    # 2) 좌|중|우 나란히 + 판정 이유 문구
+    left_h, c_h, right_h = left.shape[0], center.shape[0], right.shape[0]
+    h_min = min(left_h, c_h, right_h)
+    left = left[:h_min, :]
+    center = center[:h_min, :]
+    right = right[:h_min, :]
+    combined = np.hstack([left, center, right])
+    # cv2.putText does not support Unicode (CJK); use English for image labels
+    verdict = "Split detected" if ok else "Single detected"
+    boundary_count = int(mse_dict.get("boundary_count", 0))
+    peak_count = int(mse_dict.get("peak_count", 0))
+    label = f"{verdict}  boundaries={boundary_count} peaks={peak_count}"
+    cv2.putText(
+        combined, label, (10, 28),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0) if ok else (0, 0, 255), 2,
+    )
+    if not ok:
+        reason = f"label=single, compare_mode={compare_mode}"
+        cv2.putText(
+            combined, reason, (10, 56),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1,
+        )
+    w1, w2 = left.shape[1], left.shape[1] + center.shape[1]
+    cv2.line(combined, (w1, 0), (w1, h_min), (128, 128, 128), 2)
+    cv2.line(combined, (w2, 0), (w2, h_min), (128, 128, 128), 2)
+    # 신규 알고리즘에서는 상세 지표를 로그로 확인하고, 이미지는 좌/중/우 시각 점검에 집중
+    if export_prefix is not None:
+        lcr_path = export_dir / f"{export_prefix}_lcr_{'OK' if ok else 'NG'}.png"
+    else:
+        lcr_path = export_dir / f"left_center_right_{fname}_{'OK' if ok else 'NG'}.png"
+    ok2 = _save_png(lcr_path, combined)
+    if not ok2:
+        print(f"[경고] 이미지 저장 실패: {lcr_path}", file=sys.stderr, flush=True)
+    return ok1 and ok2
+
+
+def parse_ts_to_sec(s: str) -> float:
+    """HH:MM:SS.mmm 또는 초 단위 문자열을 초(float)로 변환."""
+    s = s.strip()
+    if ":" in s:
+        parts = s.split(":")
+        if len(parts) == 3:
+            h, m, sec = float(parts[0]), float(parts[1]), float(parts[2])
+            return h * 3600 + m * 60 + sec
+    try:
+        return float(s)
+    except ValueError:
+        raise ValueError(f"타임스탬프 형식이 올바르지 않습니다: {s!r} (예: 02:21:48.357 또는 초)") from None
+
+
+def verify_segment(
+    path: Path,
+    start_sec: float,
+    end_sec: float,
+    width: int,
+    height: int,
+    interval_sec: float,
+    compare_mode: str,
+    use_gpu: bool,
+    export_dir: Path | None = None,
+    export_max: int = 20,
+    export_only_x: bool = False,
+    align_tolerance_px: int | None = None,
+) -> None:
+    """
+    지정 구간을 일정 간격으로 샘플링해 각 시점의 삼분할 여부와 MSE를 출력.
+    export_dir이 있으면 해당 시점의 크롭 영역·좌/중/우 이미지를 저장 (프로그램이 보는 영역 확인용).
+    """
+    print(f"검증 구간: {format_ts(start_sec)} ~ {format_ts(end_sec)}  (길이 {end_sec - start_sec:.1f}초)")
+    print(f"샘플 간격: {interval_sec}초, 기준 MSE 한계: {MSE_THRESHOLD}, 모드: {_compare_mode_label_kr(compare_mode)}")
+    if export_dir is not None:
+        export_dir = export_dir.resolve()
+        if not CV2_AVAILABLE:
+            print("[경고] --verify-export를 쓰려면 opencv-python이 필요합니다. pip install opencv-python", flush=True)
+        else:
+            try:
+                export_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                print(f"[오류] 저장 폴더 생성 실패: {export_dir}  ({e})", file=sys.stderr, flush=True)
+                export_dir = None
+            else:
+                cap = "전체" if export_max <= 0 else f"최대 {export_max}개"
+                only_x = " (삼분할 X만)" if export_only_x else ""
+                print(f"이미지 저장: {export_dir}  (샘플당 2장, {cap} 시점{only_x})", flush=True)
+                print(f"  - crop_*.png: 비교에 쓰는 영역 (높이 {Y_CROP_RATIO_START*100:.0f}%~{Y_CROP_RATIO_END*100:.0f}%)")
+                print(f"  - left_center_right_*.png: 좌|중|우 구간 + 차이 열지도(빨강=다름) + 판정 이유")
+    print("-" * 60)
+    samples: list[tuple[float, bool, dict[str, float]]] = []
+    export_count = 0
+    t = start_sec
+    while t <= end_sec:
+        frame = extract_frame(path, t, width, height, use_gpu)
+        if frame is None:
+            print(f"  {format_ts(t)}  [프레임 추출 실패]", flush=True)
+            t += interval_sec
+            continue
+        result = detect_split_frame(frame, SPLIT_CFG)
+        label = str(result.get("label", "single"))
+        ok = _is_detected_label(label)
+        meta = {
+            "detected": 1.0 if ok else 0.0,
+            "boundary_count": float(len(result.get("boundaries", []))),
+            "peak_count": float(len(result.get("peak_x", []))),
+        }
+        samples.append((t, ok, meta))
+        print(
+            f"  {format_ts(t)}  label={label}  |  boundaries={result.get('boundaries', [])}  |  peaks={result.get('peak_x', [])}  |  reason={result.get('reason', '')}",
+            flush=True,
+        )
+        if export_dir is not None and CV2_AVAILABLE and (export_max <= 0 or export_count < export_max):
+            if not export_only_x or not ok:
+                if _export_verify_frames(frame, t, ok, meta, compare_mode, export_dir):
+                    export_count += 1
+        t += interval_sec
+    if export_dir is not None and CV2_AVAILABLE and export_count > 0:
+        print(f"저장 완료: {export_count}개 시점 (총 {export_count * 2}장) → {export_dir}", flush=True)
+    # 요약
+    n_ok = sum(1 for _, ok, _ in samples if ok)
+    n_total = len(samples)
+    print("-" * 60)
+    print(f"요약: {n_ok}/{n_total}개 시점이 삼분할로 판정됨.")
+    if n_total > 0 and n_ok < n_total:
+        all_mse = [v for _, _, d in samples for k, v in d.items() if k != "best_L"]
+        print(f"  지표 범위: {min(all_mse):.1f} ~ {max(all_mse):.1f}")
+        print("  → 로그의 label/reason/boundaries를 기준으로 오탐·미검출 원인을 확인하세요.")
+
+
+def _format_elapsed(sec: float) -> str:
+    """소요 시간 요약용: 60초 미만이면 X.X초, 이상이면 N분 N초."""
+    if sec >= 60:
+        m, s = int(sec // 60), int(sec % 60)
+        return f"{m}분 {s}초"
+    return f"{sec:.2f}초"
+
+
+def _print_progress(
+    current_t: float, duration: float, scan_start: float, done: int, total: int
+) -> None:
+    elapsed = time.perf_counter() - scan_start
+    pct = (current_t / duration * 100) if duration > 0 else 0
+    if elapsed >= 60:
+        em, es = int(elapsed // 60), int(elapsed % 60)
+        elapsed_str = f"{em}분 {es}초"
+    else:
+        elapsed_str = f"{int(elapsed)}초"
+    print(
+        f"  진행: {format_ts(current_t)} / {format_ts(duration)}  ({done}/{total}, {pct:.1f}%)  |  실행 경과: {elapsed_str}",
+        flush=True,
+    )
+
+
+def _coarse_worker(args: tuple) -> tuple[float, bool]:
+    """멀티프로세싱용: (path_str, t, width, height, compare_mode, use_gpu, scale_width?, cache_dir?, align_tolerance_px?, use_edge_fallback?, edge_scale_width?, edge_verify_tri?, edge_verify_bi?, edge_dup_threshold?) → (t, is_tripartite).
+    scale_width가 None이 아니면 코스 스캔만 저해상도. cache_dir이 있으면 해당 프레임을 .npy로 저장."""
+    path_str, t, width, height, compare_mode, use_gpu, scale_width, cache_dir = args[:8]
+    align_tol_px = int(args[8]) if len(args) > 8 and args[8] is not None else None
+    use_edge_fallback = bool(args[9]) if len(args) > 9 else False
+    edge_scale_width = int(args[10]) if len(args) > 10 and args[10] is not None else None
+    edge_verify_tri = bool(args[11]) if len(args) > 11 and args[11] is not None else EDGE_VERIFY_TRIPARTITE_DUPLICATE
+    edge_verify_bi = bool(args[12]) if len(args) > 12 and args[12] is not None else EDGE_VERIFY_BIPARTITE_DUPLICATE
+    edge_dup_thr = float(args[13]) if len(args) > 13 and args[13] is not None else EDGE_DUPLICATE_SIMILARITY_THRESHOLD
+    path = Path(path_str)
+    frame = extract_frame(path, t, width, height, use_gpu, scale_width=scale_width)
+    if frame is None:
+        return (t, False)
+    if cache_dir:
+        try:
+            out = Path(cache_dir) / f"frame_{t:.3f}.npy"
+            np.save(out, frame)
+        except (OSError, ValueError):
+            pass
+    result = detect_split_frame(frame, SPLIT_CFG)
+    _log_detection_result("[coarse]", t, result)
+    is_tri = _is_detected_label(str(result.get("label", "single")))
+    if not is_tri and use_edge_fallback:
+        w = frame.shape[1] if frame is not None else 0
+        scale_for_fallback = edge_scale_width if edge_scale_width is not None else w
+        is_tri_edge, is_bi = _edge_fallback_detect(
+            frame, scale_for_fallback, time_sec=t,
+            verify_tripartite_duplicate=edge_verify_tri,
+            verify_bipartite_duplicate=edge_verify_bi,
+            duplicate_similarity_threshold=edge_dup_thr,
+        )
+        if is_tri_edge or is_bi:
+            is_tri = True
+    return (t, is_tri)
+
+
+def _get_frame_for_check(
+    path: Path,
+    t: float,
+    width: int,
+    height: int,
+    use_gpu: bool,
+    cache_dir: Path | None,
+    cached_times: list[float] | None,
+) -> np.ndarray | None:
+    """캐시가 있으면 0.5초 이내 캐시 프레임 반환, 없으면 extract_frame. 경계 정밀화용."""
+    if cache_dir is not None and cached_times:
+        best = None
+        best_d = float("inf")
+        for tc in cached_times:
+            d = abs(t - tc)
+            if d <= BOUNDARY_TOLERANCE and d < best_d:
+                best_d = d
+                best = tc
+        if best is not None:
+            fpath = cache_dir / f"frame_{best:.3f}.npy"
+            if fpath.is_file():
+                try:
+                    frame = np.load(fpath)
+                    if frame.ndim == 3 and frame.shape[2] == 3:
+                        return frame
+                except (OSError, ValueError):
+                    pass
+    return extract_frame(path, t, width, height, use_gpu)
+
+
+def _check_tripartite_at(
+    path: Path,
+    t: float,
+    width: int,
+    height: int,
+    compare_mode: str = COMPARE_MODE_DEFAULT,
+    use_gpu: bool = False,
+    cache_dir: Path | None = None,
+    cached_times: list[float] | None = None,
+    cache_usable: bool = False,
+    align_tolerance_px: int | None = None,
+    use_edge_fallback: bool = False,
+    edge_scale_width: int | None = None,
+    edge_verify_tripartite: bool | None = None,
+    edge_verify_bipartite: bool | None = None,
+    edge_duplicate_threshold: float | None = None,
+) -> bool:
+    """시점 t에서 1프레임 추출(또는 캐시 로드) 후 삼분할 여부 반환."""
+    if cache_usable and cache_dir is not None and cached_times is not None:
+        frame = _get_frame_for_check(path, t, width, height, use_gpu, cache_dir, cached_times)
+    else:
+        frame = extract_frame(path, t, width, height, use_gpu)
+    if frame is None:
+        return False
+    result = detect_split_frame(frame, SPLIT_CFG)
+    _log_detection_result("[check ]", t, result)
+    is_tri = _is_detected_label(str(result.get("label", "single")))
+    if not is_tri and use_edge_fallback:
+        scale_for_fallback = edge_scale_width if edge_scale_width is not None else frame.shape[1]
+        is_tri_edge, is_bi = _edge_fallback_detect(
+            frame, scale_for_fallback, time_sec=t,
+            verify_tripartite_duplicate=edge_verify_tripartite,
+            verify_bipartite_duplicate=edge_verify_bipartite,
+            duplicate_similarity_threshold=edge_duplicate_threshold,
+        )
+        if is_tri_edge or is_bi:
+            is_tri = True
+    return is_tri
+
+
+def _binary_search_first_tripartite(
+    path: Path,
+    t_low: float,
+    t_high: float,
+    width: int,
+    height: int,
+    compare_mode: str = COMPARE_MODE_DEFAULT,
+    use_gpu: bool = False,
+    cache_dir: Path | None = None,
+    cached_times: list[float] | None = None,
+    cache_usable: bool = False,
+    tolerance_sec: float | None = None,
+    align_tolerance_px: int | None = None,
+    use_edge_fallback: bool = False,
+    edge_scale_width: int | None = None,
+    edge_verify_tripartite: bool | None = None,
+    edge_verify_bipartite: bool | None = None,
+    edge_duplicate_threshold: float | None = None,
+) -> float:
+    """[t_low, t_high] 구간에서 삼분할이 처음 나오는 시점을 이진 탐색. (t_high에서 True인 전제)"""
+    tol = tolerance_sec if tolerance_sec is not None else BOUNDARY_TOLERANCE
+    if _check_tripartite_at(
+        path, t_low, width, height, compare_mode, use_gpu,
+        cache_dir=cache_dir, cached_times=cached_times, cache_usable=cache_usable,
+        align_tolerance_px=align_tolerance_px,
+        use_edge_fallback=use_edge_fallback, edge_scale_width=edge_scale_width,
+        edge_verify_tripartite=edge_verify_tripartite, edge_verify_bipartite=edge_verify_bipartite,
+        edge_duplicate_threshold=edge_duplicate_threshold,
+    ):
+        return t_low
+    while t_high - t_low > tol:
+        mid = (t_low + t_high) * 0.5
+        if _check_tripartite_at(
+            path, mid, width, height, compare_mode, use_gpu,
+            cache_dir=cache_dir, cached_times=cached_times, cache_usable=cache_usable,
+            align_tolerance_px=align_tolerance_px,
+            use_edge_fallback=use_edge_fallback, edge_scale_width=edge_scale_width,
+            edge_verify_tripartite=edge_verify_tripartite, edge_verify_bipartite=edge_verify_bipartite,
+            edge_duplicate_threshold=edge_duplicate_threshold,
+        ):
+            t_high = mid
+        else:
+            t_low = mid
+    return t_high
+
+
+def _binary_search_last_tripartite(
+    path: Path,
+    t_low: float,
+    t_high: float,
+    width: int,
+    height: int,
+    compare_mode: str = COMPARE_MODE_DEFAULT,
+    use_gpu: bool = False,
+    cache_dir: Path | None = None,
+    cached_times: list[float] | None = None,
+    cache_usable: bool = False,
+    tolerance_sec: float | None = None,
+    align_tolerance_px: int | None = None,
+    use_edge_fallback: bool = False,
+    edge_scale_width: int | None = None,
+    edge_verify_tripartite: bool | None = None,
+    edge_verify_bipartite: bool | None = None,
+    edge_duplicate_threshold: float | None = None,
+) -> float:
+    """[t_low, t_high] 구간에서 삼분할이 마지막으로 나오는 시점을 이진 탐색. (t_low에서 True인 전제)"""
+    tol = tolerance_sec if tolerance_sec is not None else BOUNDARY_TOLERANCE
+    if _check_tripartite_at(
+        path, t_high, width, height, compare_mode, use_gpu,
+        cache_dir=cache_dir, cached_times=cached_times, cache_usable=cache_usable,
+        align_tolerance_px=align_tolerance_px,
+        use_edge_fallback=use_edge_fallback, edge_scale_width=edge_scale_width,
+        edge_verify_tripartite=edge_verify_tripartite, edge_verify_bipartite=edge_verify_bipartite,
+        edge_duplicate_threshold=edge_duplicate_threshold,
+    ):
+        return t_high
+    while t_high - t_low > tol:
+        mid = (t_low + t_high) * 0.5
+        if _check_tripartite_at(
+            path, mid, width, height, compare_mode, use_gpu,
+            cache_dir=cache_dir, cached_times=cached_times, cache_usable=cache_usable,
+            align_tolerance_px=align_tolerance_px,
+            use_edge_fallback=use_edge_fallback, edge_scale_width=edge_scale_width,
+            edge_verify_tripartite=edge_verify_tripartite, edge_verify_bipartite=edge_verify_bipartite,
+            edge_duplicate_threshold=edge_duplicate_threshold,
+        ):
+            t_low = mid
+        else:
+            t_high = mid
+    return t_low
+
+
+def _boundary_worker(args: tuple) -> tuple[float, float] | None:
+    """
+    멀티프로세싱용: 한 후보 구간의 시작·끝을 이진 탐색으로 정밀화.
+    인자 끝에 cache_dir, cached_times, cache_usable, boundary_tolerance_sec, align_tolerance_px, use_edge_fallback, edge_scale_width, edge_verify_tri, edge_verify_bi, edge_dup_threshold 추가 가능.
+    """
+    n = len(args)
+    path_str, t_prev, t_start_cand, t_end_cand, t_next, duration, width, height, compare_mode, use_gpu = args[:10]
+    cache_dir = Path(args[10]) if n > 10 and args[10] else None
+    cached_times = list(args[11]) if n > 11 and args[11] else None
+    cache_usable = bool(args[12]) if n > 12 else False
+    tolerance_sec = float(args[13]) if n > 13 and args[13] is not None else None
+    align_tol_px = int(args[14]) if n > 14 and args[14] is not None else None
+    use_edge_fallback = bool(args[15]) if n > 15 else False
+    edge_scale_width = int(args[16]) if n > 16 and args[16] is not None else None
+    edge_verify_tri = bool(args[17]) if n > 17 and args[17] is not None else EDGE_VERIFY_TRIPARTITE_DUPLICATE
+    edge_verify_bi = bool(args[18]) if n > 18 and args[18] is not None else EDGE_VERIFY_BIPARTITE_DUPLICATE
+    edge_dup_thr = float(args[19]) if n > 19 and args[19] is not None else EDGE_DUPLICATE_SIMILARITY_THRESHOLD
+    path = Path(path_str)
+    t_start = _binary_search_first_tripartite(
+        path, t_prev, t_start_cand, width, height, compare_mode, use_gpu,
+        cache_dir=cache_dir, cached_times=cached_times, cache_usable=cache_usable,
+        tolerance_sec=tolerance_sec, align_tolerance_px=align_tol_px,
+        use_edge_fallback=use_edge_fallback, edge_scale_width=edge_scale_width,
+        edge_verify_tripartite=edge_verify_tri, edge_verify_bipartite=edge_verify_bi,
+        edge_duplicate_threshold=edge_dup_thr,
+    )
+    t_end = _binary_search_last_tripartite(
+        path, t_end_cand, min(t_next, duration), width, height, compare_mode, use_gpu,
+        cache_dir=cache_dir, cached_times=cached_times, cache_usable=cache_usable,
+        tolerance_sec=tolerance_sec, align_tolerance_px=align_tol_px,
+        use_edge_fallback=use_edge_fallback, edge_scale_width=edge_scale_width,
+        edge_verify_tripartite=edge_verify_tri, edge_verify_bipartite=edge_verify_bi,
+        edge_duplicate_threshold=edge_dup_thr,
+    )
+    if t_end <= duration and (t_end - t_start) >= 0:
+        return (t_start, t_end)
+    return None
+
+
+# 코스 스캔 저해상도: 허용 폭 (640, 960, 1280). 높이는 원본 비율로 계산.
+COARSE_SCALE_WIDTHS = (640, 960, 1280)
+
+
+def find_segments(
+    path: Path,
+    duration: float,
+    width: int,
+    height: int,
+    min_duration_sec: float = MIN_SEGMENT_DURATION,
+    coarse_interval_sec: float = COARSE_INTERVAL,
+    compare_mode: str = COMPARE_MODE_DEFAULT,
+    n_workers: int = 0,
+    use_gpu: bool = False,
+    coarse_scale_width: int | None = None,
+    use_coarse_cache: bool = False,
+    boundary_tolerance_sec: float | None = None,
+    align_tolerance_px: int | None = None,
+    use_edge_fallback: bool = False,
+    edge_verify_tripartite: bool | None = None,
+    edge_verify_bipartite: bool | None = None,
+    edge_duplicate_threshold: float | None = None,
+) -> tuple[list[tuple[float, float]], dict[str, float]]:
+    """
+    삼분할 구간 탐색 (장편 영상 최적화).
+    coarse_scale_width가 640/960/1280이면 코스 스캔만 해당 폭으로 저해상도 추출(속도 실험용). 경계 정밀화는 원본 해상도.
+    use_coarse_cache=True면 코스 스캔 시 각 프레임을 임시 폴더에 저장하고, 경계 정밀화에서 원본 해상도일 때만 재사용 후 삭제.
+    boundary_tolerance_sec: 경계 이진 탐색 정밀도(초). None이면 BOUNDARY_TOLERANCE 사용. 크게 주면 경계 단계가 빨라지나 정확도 완화.
+    반환: (최종 구간 목록, 단계별 소요 시간 dict). 파이프라인 분석·효율화용.
+    """
+    timings: dict[str, float] = {}
+    path_str = str(path.resolve())
+    scale_w = coarse_scale_width if coarse_scale_width in COARSE_SCALE_WIDTHS else None
+    v_tri = edge_verify_tripartite if edge_verify_tripartite is not None else EDGE_VERIFY_TRIPARTITE_DUPLICATE
+    v_bi = edge_verify_bipartite if edge_verify_bipartite is not None else EDGE_VERIFY_BIPARTITE_DUPLICATE
+    dup_thr = edge_duplicate_threshold if edge_duplicate_threshold is not None else EDGE_DUPLICATE_SIMILARITY_THRESHOLD
+
+    cache_dir: Path | None = None
+    if use_coarse_cache:
+        try:
+            cache_dir = Path(tempfile.mkdtemp(prefix="tripartite_cache_", dir=str(path.parent)))
+        except (OSError, PermissionError):
+            cache_dir = Path(tempfile.mkdtemp(prefix="tripartite_cache_"))
+        print(f"  캐시 임시 폴더: {cache_dir}  (작업 후 삭제)", flush=True)
+    cache_dir_str = str(cache_dir) if cache_dir else None
+
+    try:
+        # 1) 시점 목록 생성
+        t0 = time.perf_counter()
+        ts: list[float] = []
+        t = 0.0
+        while t < duration:
+            ts.append(t)
+            t += coarse_interval_sec
+        if duration > 0 and (not ts or ts[-1] < duration - 0.5):
+            ts.append(max(0.0, duration - 0.1))
+        total_points = len(ts)
+        worker_args = [
+            (
+                path_str,
+                t,
+                width,
+                height,
+                compare_mode,
+                use_gpu,
+                scale_w,
+                cache_dir_str,
+                align_tolerance_px,
+                use_edge_fallback,
+                scale_w,
+                v_tri,
+                v_bi,
+                dup_thr,
+            )
+            for t in ts
+        ]
+        timings["시점 목록"] = time.perf_counter() - t0
+
+        coarse_results: list[tuple[float, bool]] = []
+        scan_start = time.perf_counter()
+
+        if n_workers <= 1:
+            for i, (_path_s, t, w, h, cm, ug, sw, _cd, align_tol, use_ef, edge_sw, _v_tri, _v_bi, _dup_thr) in enumerate(worker_args):
+                frame = extract_frame(path, t, w, h, ug, scale_width=sw)
+                if frame is None:
+                    coarse_results.append((t, False))
+                else:
+                    if cache_dir is not None:
+                        try:
+                            np.save(cache_dir / f"frame_{t:.3f}.npy", frame)
+                        except (OSError, ValueError):
+                            pass
+                    result = detect_split_frame(frame, SPLIT_CFG)
+                    _log_detection_result("[coarse]", t, result)
+                    is_tri = _is_detected_label(str(result.get("label", "single")))
+                    if not is_tri and use_ef:
+                        scale_for_fallback = edge_sw if edge_sw is not None else frame.shape[1]
+                        is_tri_edge, is_bi = _edge_fallback_detect(
+                            frame, scale_for_fallback, time_sec=t,
+                            verify_tripartite_duplicate=_v_tri,
+                            verify_bipartite_duplicate=_v_bi,
+                            duplicate_similarity_threshold=_dup_thr,
+                        )
+                        if is_tri_edge or is_bi:
+                            is_tri = True
+                    coarse_results.append((t, is_tri))
+                if (i + 1) % 30 == 0:
+                    _print_progress(ts[i], duration, scan_start, i + 1, total_points)
+        else:
+            done = 0
+            with ProcessPoolExecutor(max_workers=n_workers) as executor:
+                for res in executor.map(_coarse_worker, worker_args, chunksize=max(1, total_points // (n_workers * 4))):
+                    coarse_results.append(res)
+                    done += 1
+                    if done % 30 == 0:
+                        _print_progress(ts[done - 1] if done <= len(ts) else duration, duration, scan_start, done, total_points)
+            sort_start = time.perf_counter()
+            coarse_results.sort(key=lambda x: x[0])
+            timings["코스 정렬"] = time.perf_counter() - sort_start
+
+        scan_elapsed = time.perf_counter() - scan_start
+        timings["코스 스캔"] = scan_elapsed
+        if scan_elapsed >= 60:
+            em, es = int(scan_elapsed // 60), int(scan_elapsed % 60)
+            scan_str = f"{em}분 {es}초"
+        else:
+            scan_str = f"{scan_elapsed:.1f}초"
+        print(f"  코스 스캔 완료: {total_points}개 시점, 소요 {scan_str}", flush=True)
+
+        # 캐시된 시점 목록 (경계 정밀화에서 재사용용). 원본 해상도일 때만 경계에서 사용.
+        cached_times: list[float] = []
+        if cache_dir is not None and cache_dir.is_dir():
+            for f in cache_dir.glob("frame_*.npy"):
+                try:
+                    cached_times.append(float(f.stem.replace("frame_", "")))
+                except ValueError:
+                    continue
+            cached_times.sort()
+        cache_usable_in_boundary = (cache_dir is not None and scale_w is None and len(cached_times) > 0)
+        boundary_tol = boundary_tolerance_sec if boundary_tolerance_sec is not None else BOUNDARY_TOLERANCE
+
+        # 2) 후보 구간 수집
+        cand_start = time.perf_counter()
+        candidates: list[tuple] = []
+        i = 0
+        while i < len(coarse_results):
+            t_cur, is_tri = coarse_results[i]
+            if not is_tri:
+                i += 1
+                continue
+            t_start_cand = t_cur
+            t_end_cand = t_cur
+            j = i
+            while j < len(coarse_results) and coarse_results[j][1]:
+                t_end_cand = coarse_results[j][0]
+                j += 1
+            t_next = coarse_results[j][0] if j < len(coarse_results) else duration
+            t_prev = coarse_results[i - 1][0] if i > 0 else 0.0
+            candidates.append(
+                (
+                    path_str,
+                    t_prev,
+                    t_start_cand,
+                    t_end_cand,
+                    t_next,
+                    duration,
+                    width,
+                    height,
+                    compare_mode,
+                    use_gpu,
+                    cache_dir_str,
+                    cached_times,
+                    cache_usable_in_boundary,
+                    boundary_tol,
+                    align_tolerance_px,
+                    use_edge_fallback,
+                    width,
+                    v_tri,
+                    v_bi,
+                    dup_thr,
+                )
+            )
+            i = j
+        timings["후보 구간 수집"] = time.perf_counter() - cand_start
+
+        # 3) 경계 정밀화
+        boundary_start = time.perf_counter()
+        segments = []
+        if n_workers <= 1 or len(candidates) == 0:
+            for c in candidates:
+                (_path_s, t_prev, t_start_cand, t_end_cand, t_next, _dur, w, h, cm, ug, _cd, _ct, cache_ok, tol, align_tol, use_ef, edge_sw, _v_tri, _v_bi, _dup_thr) = c
+                t_start = _binary_search_first_tripartite(
+                    path, t_prev, t_start_cand, w, h, cm, ug,
+                    cache_dir=cache_dir, cached_times=cached_times if cache_ok else None, cache_usable=cache_ok,
+                    tolerance_sec=tol, align_tolerance_px=align_tol,
+                    use_edge_fallback=use_ef, edge_scale_width=edge_sw,
+                    edge_verify_tripartite=_v_tri, edge_verify_bipartite=_v_bi, edge_duplicate_threshold=_dup_thr,
+                )
+                t_end = _binary_search_last_tripartite(
+                    path, t_end_cand, min(t_next, duration), w, h, cm, ug,
+                    cache_dir=cache_dir, cached_times=cached_times if cache_ok else None, cache_usable=cache_ok,
+                    tolerance_sec=tol, align_tolerance_px=align_tol,
+                    use_edge_fallback=use_ef, edge_scale_width=edge_sw,
+                    edge_verify_tripartite=_v_tri, edge_verify_bipartite=_v_bi, edge_duplicate_threshold=_dup_thr,
+                )
+                if t_end <= duration and (t_end - t_start) >= 0:
+                    segments.append((t_start, t_end))
+                    print(f"  [발견] {format_ts(t_start)} ~ {format_ts(t_end)}", flush=True)
+        else:
+            n_boundary = min(n_workers, len(candidates))
+            with ProcessPoolExecutor(max_workers=n_boundary) as executor:
+                results = list(
+                    executor.map(
+                        _boundary_worker,
+                        candidates,
+                        chunksize=max(1, len(candidates) // (n_boundary * 2)),
+                    )
+                )
+            for res in results:
+                if res is not None:
+                    segments.append(res)
+            segments.sort(key=lambda x: x[0])
+            for t_start, t_end in segments:
+                print(f"  [발견] {format_ts(t_start)} ~ {format_ts(t_end)}", flush=True)
+
+        boundary_elapsed = time.perf_counter() - boundary_start
+        timings["경계 정밀화"] = boundary_elapsed
+        if boundary_elapsed >= 60:
+            bm, bs = int(boundary_elapsed // 60), int(boundary_elapsed % 60)
+            boundary_str = f"{bm}분 {bs}초"
+        else:
+            boundary_str = f"{boundary_elapsed:.1f}초"
+        print(f"  경계 정밀화(발견) 완료: {len(segments)}개, 소요 {boundary_str}", flush=True)
+
+        # 4) 인접 구간 병합 (끝~다음 시작이 MERGE_GAP_SECONDS 이내면 하나로)
+        merge_start = time.perf_counter()
+        merged = merge_adjacent_segments(segments)
+        timings["병합"] = time.perf_counter() - merge_start
+
+        # 5) 최소 길이 미만 구간 제거 (min_duration_sec이 0이면 제거 안 함)
+        filter_start = time.perf_counter()
+        result = [(a, b) for a, b in merged if (b - a) >= min_duration_sec]
+        timings["최소 길이 필터"] = time.perf_counter() - filter_start
+        return (result, timings)
+    finally:
+        if cache_dir is not None and cache_dir.is_dir():
+            try:
+                shutil.rmtree(cache_dir, ignore_errors=True)
+            except OSError:
+                pass
+
+
+def merge_adjacent_segments(
+    segments: list[tuple[float, float]], gap_sec: float = MERGE_GAP_SECONDS
+) -> list[tuple[float, float]]:
+    """
+    연속된 구간 중 '앞 구간 끝 ~ 다음 구간 시작'이 gap_sec 초 이내면 하나로 합침.
+    정렬된 (start, end) 리스트를 받아 병합된 리스트 반환.
+    """
+    merged: list[tuple[float, float]] = []
+    for start, end in sorted(segments):
+        if merged and (start - merged[-1][1]) <= gap_sec:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def load_segments_from_file(file_path: Path) -> list[tuple[float, float]]:
+    """
+    구간 목록 텍스트 파일을 읽어 (start_sec, end_sec) 리스트로 반환.
+    한 줄에 하나의 구간: "START END" (공백/탭 구분). START/END는 HH:MM:SS.mmm 또는 초.
+    빈 줄, # 으로 시작하는 줄은 무시. 원하는 구간만 남기고 나머지 줄을 삭제하거나 # 처리하면 됨.
+    """
+    segments: list[tuple[float, float]] = []
+    path = Path(file_path).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"구간 목록 파일을 찾을 수 없습니다: {path}")
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            start = parse_ts_to_sec(parts[0])
+            end = parse_ts_to_sec(parts[1])
+            if end > start:
+                segments.append((start, end))
+        except ValueError:
+            continue
+    return segments
+
+
+def write_segments_to_file(segments: list[tuple[float, float]], file_path: Path) -> None:
+    """구간 목록을 텍스트 파일로 저장. 한 줄에 '시작 시각 끝 시각 # 길이(초)'. # 으로 시작하는 줄은 주석."""
+    path = Path(file_path).resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    comment = "# 시작 시각 끝 시각 (한 줄에 한 구간. 해당 줄 삭제 또는 # 붙이면 병합에서 제외)"
+    lines = [comment] + [f"{format_ts(s)} {format_ts(e)} # {e - s:.1f}초" for s, e in segments]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _seg_output_path_for_input(input_path: Path) -> Path:
+    """기본 구간 목록 파일명(원본_seg.txt). 이미 존재하면 _seg(1).txt, _seg(2).txt ... 중 존재하지 않는 이름 반환."""
+    base = input_path.parent / (input_path.stem + "_seg.txt")
+    if not base.exists():
+        return base
+    n = 1
+    while True:
+        candidate = input_path.parent / (input_path.stem + f"_seg({n}).txt")
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
+def _merge_segment_worker(args: tuple) -> tuple:
+    """
+    병렬용: 한 구간을 cut → 키프레임 탐색 → 앞/뒤 트림해 segment_xxxx.ts 생성.
+    args = (path_str, start, end, index_0based, tmpdir_str, use_gpu, leading_buffer_sec, trailing_buffer_sec, duration_sec, is_last_segment?)
+    is_last_segment=True면 끝을 '구간 끝 키프레임'이 아니라 '그 다음 키프레임'까지 포함 (삼분할이 끝난 뒤 조금 더 포함).
+    반환: (index_0based, success, elapsed_sec, first_kf, last_kf, duration_cut, buffer_sec, cut_sec, trim_sec)
+    """
+    n = len(args)
+    path_str, start, end, idx, tmpdir_str, use_gpu, leading_sec, trailing_sec, duration_sec = args[:9]
+    is_last_segment = bool(args[9]) if n > 9 else False
+    t0 = time.perf_counter()
+    tmpdir = Path(tmpdir_str)
+    seg_path = tmpdir / f"segment_{idx + 1:04d}.ts"
+    temp_seg = tmpdir / f"segment_{idx + 1:04d}_temp.ts"
+    start_cut = max(0.0, start - leading_sec)
+    end_cut = min(duration_sec, end + trailing_sec)
+    duration_cut = end_cut - start_cut
+    cmd_cut = ["ffmpeg", "-y"]
+    if use_gpu:
+        cmd_cut.extend(["-hwaccel", "cuda"])
+    cmd_cut.extend([
+        "-ss", str(start_cut), "-i", path_str,
+        "-t", str(duration_cut), "-c", "copy",
+        "-avoid_negative_ts", "make_zero", str(temp_seg),
+    ])
+    t_cut_start = time.perf_counter()
+    ret = subprocess.run(cmd_cut, capture_output=True, timeout=3600)
+    cut_sec = time.perf_counter() - t_cut_start
+    if ret.returncode != 0 or not temp_seg.is_file():
+        return (idx, False, time.perf_counter() - t0, None, None, None, cut_sec, None)
+    keyframes = _get_keyframe_times_from_file(temp_seg)
+    first_kf = keyframes[0] if keyframes else 0.0
+    # 종료 구간: 자른 조각 내에서 마지막 키프레임(구간 끝 이하)에서 끊기. 마지막 구간이면 그 다음 키프레임까지 포함.
+    valid_end = [k for k in keyframes if k <= duration_cut]
+    last_kf = max(valid_end) if valid_end else duration_cut
+    if is_last_segment and keyframes:
+        next_kfs = [k for k in keyframes if k > last_kf and k <= duration_cut]
+        if next_kfs:
+            trim_end_kf = min(next_kfs)
+        else:
+            trim_end_kf = last_kf
+    else:
+        trim_end_kf = last_kf
+    trim_dur = trim_end_kf - first_kf
+    trim_sec = 0.0
+    if trim_dur > 0.5:
+        cmd_trim = [
+            "ffmpeg", "-y", "-ss", str(first_kf), "-i", str(temp_seg),
+            "-t", str(trim_dur), "-c", "copy", "-avoid_negative_ts", "make_zero", str(seg_path),
+        ]
+        t_trim_start = time.perf_counter()
+        ret2 = subprocess.run(cmd_trim, capture_output=True, timeout=300)
+        trim_sec = time.perf_counter() - t_trim_start
+        temp_seg.unlink(missing_ok=True)
+        if ret2.returncode != 0 or not seg_path.is_file():
+            return (idx, False, time.perf_counter() - t0, None, None, None, cut_sec, trim_sec)
+    else:
+        temp_seg.rename(seg_path)
+    elapsed = time.perf_counter() - t0
+    return (idx, True, elapsed, first_kf, trim_end_kf, duration_cut, start - start_cut, cut_sec, trim_sec)
+
+
+def _merge_notify(mode: str, output_path: Path, n_segments: int) -> None:
+    """
+    병합·복사 완료 시 알림. mode: 'print' | 'sound' | 'toast' | 'all'
+    - print: 콘솔 메시지(이미 출력된 후 호출되므로 추가 메시지만)
+    - sound: 비프음 (Windows winsound, 그 외 \\a 벨)
+    - toast: Windows 토스트. win11toast(권장, Win11/10) 또는 win10toast-click 있으면 클릭 시 탐색기에서 해당 파일 위치 열기, 없으면 plyer 사용(클릭 동작 없음)
+    """
+    if not mode or mode == "print":
+        return  # print는 호출 전 이미 출력됨
+    if mode == "all":
+        _merge_notify("sound", output_path, n_segments)
+        _merge_notify("toast", output_path, n_segments)
+        return
+    if mode == "sound":
+        try:
+            if os.name == "nt":
+                import winsound
+                winsound.Beep(1000, 300)
+            else:
+                sys.stdout.write("\a")
+                sys.stdout.flush()
+        except Exception:
+            pass
+        return
+    if mode == "toast":
+        dest_str = str(output_path.resolve())
+        # Windows: 클릭 시 탐색기에서 해당 파일 선택해서 열기
+        def _open_in_explorer(_args: dict | None = None) -> None:
+            try:
+                if os.name == "nt":
+                    subprocess.Popen(["explorer", "/select", dest_str], shell=False)
+            except Exception:
+                pass
+        try:
+            if os.name == "nt":
+                # Windows 11/10 호환: win11toast 우선 (WinRT 기반, Win11 25H2 등에서 동작)
+                from win11toast import notify
+                notify(
+                    "검출된 구간 병합 완료",
+                    f"{output_path.name}  ({n_segments}개 구간)\n클릭 시 폴더에서 파일 위치 열기",
+                    on_click=_open_in_explorer,
+                )
+                return
+        except Exception:
+            pass
+        try:
+            if os.name == "nt":
+                from win10toast_click import ToastNotifier
+                toaster = ToastNotifier()
+                toaster.show_toast(
+                    "검출된 구간 병합 완료",
+                    f"{output_path.name}  ({n_segments}개 구간)\n클릭 시 폴더에서 파일 위치 열기",
+                    duration=5,
+                    threaded=True,
+                    callback_on_click=_open_in_explorer,
+                )
+                return
+        except Exception:
+            pass
+        try:
+            from plyer import notification
+            notification.notify(
+                title="검출된 구간 병합 완료",
+                message=f"{output_path.name}  ({n_segments}개 구간)",
+                timeout=5,
+            )
+        except Exception:
+            pass
+
+
+def _merge_stem_from_original_stem(stem: str, merged_label: str) -> str:
+    """
+    stem이 ID_YYYYMMDD_NNNNNN_나머지 형태(언더스코어 구분, 2번째 8자리 숫자=날짜, 3번째 6자리 숫자)이면
+    네 번째 토큰 자리에 merged_label을 끼워 넣는다. 아니면 stem_merged_label.
+    """
+    parts = stem.split("_")
+    if len(parts) >= 4:
+        date_part, rand_part = parts[1], parts[2]
+        if (
+            len(date_part) == 8
+            and date_part.isdigit()
+            and len(rand_part) == 6
+            and rand_part.isdigit()
+        ):
+            return "_".join(parts[:3] + [merged_label] + parts[3:])
+    return f"{stem}_{merged_label}"
+
+
+def _merge_output_path_for_input(input_path: Path) -> Path:
+    """
+    기본 병합 파일명: 패턴에 맞으면 ID_날짜_랜덤6자리_merged_나머지.mp4,
+    아니면 원본stem_merged.mp4. 이미 존재하면 merged → merged(1), merged(2) ...
+    """
+    ext = ".mp4"
+    stem_merged = _merge_stem_from_original_stem(input_path.stem, "merged")
+    base = input_path.parent / (stem_merged + ext)
+    if not base.exists():
+        return base
+    n = 1
+    while True:
+        stem_n = _merge_stem_from_original_stem(input_path.stem, f"merged({n})")
+        candidate = input_path.parent / (stem_n + ext)
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
+def merge_segments(
+    path: Path,
+    segments: list[tuple[float, float]],
+    output_path: Path,
+    use_gpu: bool = False,
+    merge_workers: int = 2,
+    merge_notify: str = "print",
+) -> bool:
+    """
+    구간 목록을 ffmpeg로 코덱 카피(-c copy)해 잘라 concat demuxer로 이어붙여 output_path에 저장.
+    모든 구간: 시작 3초 앞~끝 3초 뒤까지 포함해 자른 뒤, 그 조각에서 시작은 첫 키프레임부터,
+    끝은 마지막 키프레임(종료 구간~뒤 3초 사이)까지 사용해 이어붙임.
+    """
+    LEADING_BUFFER_SEC = 3.0   # 각 구간 자를 때 시작점 이전 3초까지 포함
+    TRAILING_BUFFER_SEC = 3.0  # 각 구간 자를 때 종료점 이후 3초까지 포함 (끝 키프레임 탐색용)
+    TRAILING_BUFFER_LAST_SEC = 12.0  # 마지막 구간: 끝 다음 키프레임까지 포함하려면 버퍼를 더 둠
+    if not segments:
+        return False
+    try:
+        duration_sec = get_video_info(path)[0]
+    except RuntimeError:
+        duration_sec = 1e9  # ffprobe 실패 시 제한 없이 end+3 사용
+    output_path = output_path.resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    path_str = str(path.resolve())
+    # 임시 작업은 로컬 고정 경로(Videos 내 전용 폴더)에서 수행해 concat/쓰기 속도 체감
+    merge_base = MERGE_TMP_BASE
+    merge_base.mkdir(parents=True, exist_ok=True)
+    tmpdir = Path(tempfile.mkdtemp(prefix="merge_", dir=str(merge_base)))
+    print(f"  병합 임시 폴더: {tmpdir}  (작업 후 삭제)", flush=True)
+    merge_start = time.perf_counter()
+    try:
+        list_path = tmpdir / "list.txt"
+        for i, (start, end) in enumerate(segments):
+            if (end - start) <= 0:
+                print(f"[오류] 구간 [{i + 1}] 길이 <= 0: {format_ts(start)} ~ {format_ts(end)}", file=sys.stderr)
+                return False
+        n_seg = len(segments)
+        n_workers = max(1, merge_workers)
+        if n_seg >= 2:
+            worker_args = [
+                (
+                    path_str, start, end, i, str(tmpdir), use_gpu,
+                    LEADING_BUFFER_SEC,
+                    TRAILING_BUFFER_LAST_SEC if i == n_seg - 1 else TRAILING_BUFFER_SEC,
+                    duration_sec,
+                    i == n_seg - 1,
+                )
+                for i, (start, end) in enumerate(segments)
+            ]
+            with ProcessPoolExecutor(max_workers=n_workers) as executor:
+                results = list(executor.map(_merge_segment_worker, worker_args, chunksize=1))
+            for idx, ok, elapsed, first_kf, last_kf, duration_cut, buffer_sec, cut_sec, trim_sec in results:
+                if not ok:
+                    print(f"[오류] 구간 [{idx + 1}] 추출 또는 트림 실패", file=sys.stderr)
+                    return False
+                cut_str = f" cut {cut_sec:.1f}초" if cut_sec is not None else ""
+                trim_str = f" trim {trim_sec:.1f}초" if trim_sec is not None and trim_sec > 0 else ""
+                print(f"  구간 [{idx + 1}/{n_seg}]  추출 완료 (앞 {buffer_sec:.1f}초 포함, 길이 {duration_cut:.1f}초){cut_str}{trim_str}  소요 {elapsed:.1f}초", flush=True)
+                if first_kf is not None and first_kf > 0.01:
+                    print(f"  구간 [{idx + 1}] 앞부분 트림: 첫 키프레임({first_kf:.2f}초)부터 사용 (앞 {first_kf:.1f}초 제거)", flush=True)
+                if last_kf is not None and duration_cut - last_kf > 0.01:
+                    end_desc = "다음 키프레임" if idx == n_seg - 1 else "마지막 키프레임"
+                    print(f"  구간 [{idx + 1}] 뒷부분 트림: {end_desc}({last_kf:.2f}초)까지 사용 (뒤 {duration_cut - last_kf:.1f}초 제거)", flush=True)
+        else:
+            (start, end) = segments[0]
+            seg_path = tmpdir / "segment_0001.ts"
+            temp_seg = tmpdir / "segment_0001_temp.ts"
+            start_cut = max(0.0, start - LEADING_BUFFER_SEC)
+            end_cut = min(duration_sec, end + TRAILING_BUFFER_LAST_SEC)  # 단일 구간 = 마지막 구간, 다음 키프레임까지 포함하려 버퍼 확대
+            duration_cut = end_cut - start_cut
+            cmd_cut = ["ffmpeg", "-y"]
+            if use_gpu:
+                cmd_cut.extend(["-hwaccel", "cuda"])
+            cmd_cut.extend([
+                "-ss", str(start_cut), "-i", path_str,
+                "-t", str(duration_cut), "-c", "copy",
+                "-avoid_negative_ts", "make_zero", str(temp_seg),
+            ])
+            ret = subprocess.run(cmd_cut, capture_output=True, timeout=3600)
+            if ret.returncode != 0 or not temp_seg.is_file():
+                print(f"[오류] 구간 [1] 추출 실패: {format_ts(start_cut)} ~ {format_ts(end_cut)}", file=sys.stderr)
+                return False
+            print(f"  구간 [1/1]  추출 완료 (앞 {start - start_cut:.1f}초 포함, 길이 {duration_cut:.1f}초)", flush=True)
+            keyframes = _get_keyframe_times_from_file(temp_seg)
+            first_kf = keyframes[0] if keyframes else 0.0
+            valid_end = [k for k in keyframes if k <= duration_cut]
+            last_kf = max(valid_end) if valid_end else duration_cut
+            next_kfs = [k for k in keyframes if k > last_kf and k <= duration_cut] if keyframes else []
+            trim_end_kf = min(next_kfs) if next_kfs else last_kf
+            trim_dur = trim_end_kf - first_kf
+            if trim_dur > 0.5:
+                cmd_trim = [
+                    "ffmpeg", "-y", "-ss", str(first_kf), "-i", str(temp_seg),
+                    "-t", str(trim_dur), "-c", "copy", "-avoid_negative_ts", "make_zero", str(seg_path),
+                ]
+                ret2 = subprocess.run(cmd_trim, capture_output=True, timeout=300)
+                temp_seg.unlink(missing_ok=True)
+                if ret2.returncode != 0 or not seg_path.is_file():
+                    print(f"[오류] 구간 [1] 키프레임 트림 실패", file=sys.stderr)
+                    return False
+                if first_kf > 0.01:
+                    print(f"  구간 [1] 앞부분 트림: 첫 키프레임({first_kf:.2f}초)부터 사용 (앞 {first_kf:.1f}초 제거)", flush=True)
+                if duration_cut - trim_end_kf > 0.01:
+                    print(f"  구간 [1] 뒷부분 트림: 마지막 구간이므로 다음 키프레임({trim_end_kf:.2f}초)까지 사용 (뒤 {duration_cut - trim_end_kf:.1f}초 제거)", flush=True)
+            else:
+                temp_seg.rename(seg_path)
+        with open(list_path, "w", encoding="utf-8") as f:
+            for i in range(len(segments)):
+                seg_name = f"segment_{i + 1:04d}.ts"
+                f.write(f"file '{seg_name}'\n")
+        # concat은 항상 로컬 임시 파일에 먼저 써서 속도 확보, 이후 최종 경로로 복사
+        local_merged = tmpdir / "merged.mp4"
+        concat_start = time.perf_counter()
+        cmd_concat = [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", str(list_path), "-c", "copy", str(local_merged),
+        ]
+        ret = subprocess.run(cmd_concat, capture_output=True, timeout=3600, cwd=str(tmpdir))
+        concat_elapsed = time.perf_counter() - concat_start
+        if ret.returncode != 0 or not local_merged.is_file():
+            print("[오류] 구간 합치기(concat) 실패", file=sys.stderr)
+            return False
+        print(f"  concat 합치기(로컬)  소요 {concat_elapsed:.1f}초", flush=True)
+        # 최종 경로가 로컬 임시와 다르면 블로킹 복사 후 검증·완료 알림
+        if local_merged.resolve() != output_path.resolve():
+            dest = output_path.resolve()
+            print(f"  최종 파일 복사 중... → {dest}", flush=True)
+            copy_start = time.perf_counter()
+            try:
+                # Windows UNC: copyfile만 쓰면 메타데이터(copystat) 오류 회피. 목적지 존재·크기 검증.
+                shutil.copyfile(str(local_merged), str(dest))
+                # 메타데이터는 복사 실패해도 파일은 있으면 성공으로 간주
+                try:
+                    shutil.copystat(str(local_merged), str(dest))
+                except OSError:
+                    pass
+            except OSError as e:
+                print(f"[오류] 최종 경로로 복사 실패: {dest}", file=sys.stderr)
+                print(f"  {e}", file=sys.stderr)
+                return False
+            copy_elapsed = time.perf_counter() - copy_start
+            # 복사 후 목적지 존재·크기 검증 (UNC 등에서 실제로 쓰이지 않는 경우 대비)
+            try:
+                if not dest.exists():
+                    print(f"[오류] 복사 후 목적지 파일이 없습니다: {dest}", file=sys.stderr)
+                    return False
+                src_size = local_merged.stat().st_size
+                dst_size = dest.stat().st_size
+                if dst_size != src_size:
+                    print(f"[오류] 복사 후 크기 불일치 (원본 {src_size}, 목적지 {dst_size}): {dest}", file=sys.stderr)
+                    return False
+            except OSError as e:
+                print(f"[오류] 복사 검증 실패: {e}", file=sys.stderr)
+                return False
+            total_elapsed = time.perf_counter() - merge_start
+            print(f"  복사 완료 (소요 {copy_elapsed:.1f}초)", flush=True)
+            print(f"병합 완료: {dest}  (총 {len(segments)}개 구간, 병합 총 소요 {total_elapsed:.1f}초)", flush=True)
+            _merge_notify(merge_notify, output_path, len(segments))
+        else:
+            total_elapsed = time.perf_counter() - merge_start
+            print(f"병합 완료: {output_path}  (총 {len(segments)}개 구간, 병합 총 소요 {total_elapsed:.1f}초)", flush=True)
+            _merge_notify(merge_notify, output_path, len(segments))
+        return True
+    finally:
+        try:
+            for f in tmpdir.iterdir():
+                f.unlink(missing_ok=True)
+            tmpdir.rmdir()
+        except OSError:
+            pass
+
+
+def main() -> None:
+    global EDGE_VERIFY_TRIPARTITE_DUPLICATE, EDGE_VERIFY_BIPARTITE_DUPLICATE, EDGE_DUPLICATE_SIMILARITY_THRESHOLD
+    example_cli = (
+        "실행 예시:\n"
+        "  python tripartite_section_check_algorithm_test.py input.ts\n"
+        "  python tripartite_section_check_algorithm_test.py input.ts --verify 00:10:00 00:12:00 --verify-interval 2\n"
+        "  python tripartite_section_check_algorithm_test.py input.ts --debug-frame 00:45:10.312 --debug-scale 640\n"
+        "  python tripartite_section_check_algorithm_test.py input.ts --merge\n"
+        " python tripartite_section_check_algorithm_test.py input.ts --workers 2 --coarse-interval 30 --coarse-scale 640 --merge-workers 2  --merge-notify all --segments-out --merge --edge-fallback\n"
+    )
+    parser = argparse.ArgumentParser(
+        description="영상에서 삼분할/이분할 구간 검출 (신규 알고리즘, y 중앙부 샘플)",
+        epilog=example_cli,
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    parser.add_argument("input", nargs="?", type=Path, help="입력 영상 파일 (예: input.ts)")
+    parser.add_argument("--no-min-duration", action="store_true", help="최소 구간 길이(20초) 검사 없이 모두 출력")
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="좌·중 및 중·우 MSE를 모두 기준 이하로 요구 (--compare-pair lc_rc 와 동일). 지정 시 --compare-pair 는 무시됨",
+    )
+    parser.add_argument(
+        "--compare-pair",
+        type=str,
+        default=COMPARE_MODE_DEFAULT,
+        choices=VALID_COMPARE_MODES,
+        metavar="MODE",
+        help="MSE 비교 쌍: lr=좌·우, lc=좌·중, cr=중·우, lc_rc=좌·중·과·중·우 모두. 기본 lr. --strict 이면 lc_rc 로 고정",
+    )
+    parser.add_argument(
+        "--coarse-interval",
+        type=float,
+        default=COARSE_INTERVAL,
+        metavar="SEC",
+        help=f"코스 스캔 간격(초). 기본 %(default)s. 30이면 더 촘촘, 120이면 더 성기게",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        metavar="N",
+        help=f"코스 스캔 병렬 프로세스 수 (CPU 멀티코어). 기본 %(default)s. 1이면 순차 처리",
+    )
+    parser.add_argument(
+        "--coarse-scale",
+        type=int,
+        default=None,
+        metavar="W",
+        choices=COARSE_SCALE_WIDTHS,
+        help="코스 스캔만 저해상도로 수행 (폭 640/960/1280). 미지정 시 원본 해상도. 경계 정밀화는 항상 원본.",
+    )
+    parser.add_argument(
+        "--coarse-cache",
+        action="store_true",
+        help="코스 스캔 시 각 시점 프레임을 임시 폴더에 캐시. 경계 정밀화에서 원본 해상도일 때만 재사용 후 작업 끝에 삭제. --coarse-scale과 함께 사용 가능(캐시는 저장만, 경계에서는 원본 해상도 사용).",
+    )
+    parser.add_argument(
+        "--edge-fallback",
+        action="store_true",
+        help="처리 순서: 삼분할(MSE) → 실패 시 신규 삼분할(엣지) → 실패 시 이분할(엣지). test/edge_check_ver1_down_scale 알고리즘 + 좌·중·우/좌·우 패치 유사도 검증 적용. scale 640 사용 시 미검출 보완용.",
+    )
+    parser.add_argument(
+        "--no-verify-edge-tripartite",
+        action="store_true",
+        help="--edge-fallback 시 삼분할 엣지 검출 후 좌·중·우 패치 유사도 검증 생략",
+    )
+    parser.add_argument(
+        "--no-verify-edge-duplicate",
+        action="store_true",
+        help="--edge-fallback 시 이분할 엣지 검출 후 좌/우 동일 영상 유사도 검증 생략",
+    )
+    parser.add_argument(
+        "--edge-duplicate-threshold",
+        type=float,
+        default=EDGE_DUPLICATE_SIMILARITY_THRESHOLD,
+        metavar="F",
+        help="--edge-fallback 시 삼/이분할 패치 유사도 기준 (0~1). 기본 %(default)s. 좌==우 or 중==좌 or 중==우 등 하나만 만족해도 통과",
+    )
+    parser.add_argument(
+        "--boundary-tolerance",
+        type=float,
+        default=None,
+        metavar="SEC",
+        help="경계 이진 탐색 정밀도(초). 미지정 시 기본값(0.9375). 크게 주면 경계 단계가 빨라지나 정확도 완화. 예: 0.5(더 정밀), 1.0",
+    )
+    parser.add_argument(
+        "--align-tolerance",
+        type=int,
+        default=None,
+        metavar="PX",
+        help="경계 정렬 탐색 허용(픽셀). 0이면 고정 1/3·2/3만 사용. N이면 w/3±N 픽셀 범위에서 최적 좌/우 너비 탐색. 미지정 시 기본값(0). 예: 10, 30",
+    )
+    parser.add_argument(
+        "--cuda",
+        action="store_true",
+        help="GPU 사용: ffmpeg CUDA 디코딩, CuPy 있으면 판정 연산도 GPU (NVIDIA 드라이버 필요)",
+    )
+    parser.add_argument(
+        "--verify",
+        nargs=2,
+        metavar=("START", "END"),
+        help="지정 구간만 검증: 삼분할 여부와 MSE를 샘플별로 리포팅 (파인튜닝·미검출 원인 분석용). 예: --verify 02:21:48.357 02:30:00.679",
+    )
+    parser.add_argument(
+        "--verify-interval",
+        type=float,
+        default=5.0,
+        metavar="SEC",
+        help="--verify 시 샘플 간격(초). 기본 5. 더 촘촘히 보려면 1~2",
+    )
+    parser.add_argument(
+        "--verify-export",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="--verify 시 프로그램이 보는 영역(크롭)·좌/중/우 이미지를 저장할 폴더. opencv-python 필요",
+    )
+    parser.add_argument(
+        "--verify-export-max",
+        type=int,
+        default=20,
+        metavar="N",
+        help="--verify-export 시 저장할 시점 개수. 0이면 전부. 기본 20",
+    )
+    parser.add_argument(
+        "--verify-export-only-x",
+        action="store_true",
+        help="--verify-export 시 삼분할 X(불일치)로 판정된 시점만 이미지 저장",
+    )
+    parser.add_argument(
+        "--debug-frame",
+        type=str,
+        default=None,
+        metavar="TIMESTAMP",
+        help="지정 시점 한 프레임만 삼분할 판정 후 debug 폴더에 디버그 이미지 저장 후 종료. --edge-fallback 과 함께 쓰면 해당 시점에서 엣지 삼/이분할 판정 후 *_edge.jpg 도 저장 (오탐 분석용). 예: --debug-frame 00:01:30 --debug-scale 640 --edge-fallback",
+    )
+    parser.add_argument(
+        "--debug-dir",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="--debug-frame 시 이미지를 저장할 폴더. 미지정 시 현재 디렉터리/debug",
+    )
+    parser.add_argument(
+        "--debug-scale",
+        type=int,
+        default=None,
+        metavar="W",
+        choices=COARSE_SCALE_WIDTHS,
+        help="--debug-frame 시 프레임 추출 해상도(폭). 640/960/1280. 미지정 시 원본 해상도. --coarse-scale 640 과 동일 조건으로 보려면 640",
+    )
+    parser.add_argument(
+        "--merge",
+        nargs="?",
+        const=True,
+        default=None,
+        metavar="OUTPUT",
+        help="검출된 구간만 코덱 카피로 잘라서 한 파일로 이어붙여 저장. 인자 없으면 원본과 같은 폴더에 저장: 파일명이 ID_YYYYMMDD_6자리숫자_... 형태면 네 번째 토큰 위치에 merged를 끼운 이름.mp4, 아니면 원본stem_merged.mp4. 경로/파일명을 주면 그 위치에 저장. 예: --merge 또는 --merge F:\\세경\\result.mp4",
+    )
+    parser.add_argument(
+        "--merge-workers",
+        type=int,
+        default=2,
+        metavar="N",
+        help="병합 시 구간 추출 병렬 워커 수. 기본 2(네트워크/HDD 권장). 로컬 NVMe면 4~8 시도 가능. 예: --merge-workers 6",
+    )
+    parser.add_argument(
+        "--merge-notify",
+        type=str,
+        default="print",
+        choices=("print", "sound", "toast", "all"),
+        metavar="MODE",
+        help="병합·복사 완료 시 알림. print=콘솔만, sound=비프음, toast=Windows 토스트(win11toast 권장·Win11 호환, 클릭 시 폴더 열기; 없으면 win10toast-click→plyer), all=sound+toast. 기본 print",
+    )
+    parser.add_argument(
+        "--segments-out",
+        nargs="?",
+        const=True,
+        default=None,
+        metavar="FILE",
+        help="검출된 구간 목록을 텍스트 파일로 저장. 인자 없으면 원본과 같은 폴더에 원본파일명_seg.txt 로 저장. 경로 지정 시 그 위치에 저장",
+    )
+    parser.add_argument(
+        "--segments-in",
+        nargs="?",
+        const=True,
+        default=None,
+        metavar="FILE",
+        help="구간 검출 대신 파일에서 구간 목록 읽기. 인자 없으면 원본과 같은 폴더의 원본파일명_seg.txt 사용. 빈 줄·# 줄 무시",
+    )
+    args = parser.parse_args()
+    if args.input is None:
+        parser.print_usage()
+        print("오류: input 인자가 필요합니다.\n")
+        print(example_cli)
+        sys.exit(2)
+
+    # 실행 로그를 logs 폴더 내 일별 하위 폴더에 txt로 저장 (stdout/stderr 동시 기록)
+    now = datetime.now()
+    log_dir = LOG_DIR / now.strftime("%Y-%m-%d")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"tripartite_{now.strftime('%Y%m%d_%H%M%S')}.txt"
+    log_file = open(log_path, "w", encoding="utf-8")
+    # 로그 최상단에 실행한 CLI 명령 기록
+    cmd_line = sys.executable + " " + " ".join(shlex.quote(arg) for arg in sys.argv)
+    log_file.write("# 실행 명령: " + cmd_line + "\n")
+    log_file.write("# " + "=" * 60 + "\n")
+    log_file.flush()
+    _orig_stdout, _orig_stderr = sys.stdout, sys.stderr
+    sys.stdout = _Tee(_orig_stdout, log_file)
+    sys.stderr = _Tee(_orig_stderr, log_file)
+    print(f"로그 저장: {log_path}", flush=True)
+
+    try:
+        path = args.input.resolve()
+        if not path.is_file():
+            print(f"[오류] 파일을 찾을 수 없습니다: {path}", file=sys.stderr)
+            sys.exit(1)
+        run_start_wall = time.perf_counter()
+
+        use_gpu = getattr(args, "cuda", False)
+        segments_in = getattr(args, "segments_in", None)
+        segments_out = getattr(args, "segments_out", None)
+        compare_mode: str = args.compare_pair if args.compare_pair in VALID_COMPARE_MODES else COMPARE_MODE_DEFAULT
+        if args.strict:
+            compare_mode = "lc_rc"
+
+        # --debug-frame: 지정 시점 한 프레임만 삼분할 판정 후 debug 폴더에 이미지 저장하고 종료
+        if getattr(args, "debug_frame", None) is not None:
+            try:
+                time_sec = parse_ts_to_sec(args.debug_frame)
+            except ValueError as e:
+                print(f"[오류] {e}", file=sys.stderr)
+                sys.exit(1)
+            try:
+                duration, width, height = get_video_info(path)
+            except RuntimeError as e:
+                print(f"[오류] {e}", file=sys.stderr)
+                sys.exit(1)
+            if not (0 <= time_sec < duration):
+                print(f"[오류] 타임스탬프가 영상 구간 밖입니다: {format_ts(time_sec)} (영상 길이 {format_ts(duration)})", file=sys.stderr)
+                sys.exit(1)
+            debug_scale = getattr(args, "debug_scale", None)
+            scale_w = debug_scale if debug_scale in COARSE_SCALE_WIDTHS else None
+            frame = extract_frame(path, time_sec, width, height, use_gpu=use_gpu, scale_width=scale_w)
+            if frame is None:
+                print(f"[오류] 해당 시점 프레임 추출 실패: {format_ts(time_sec)}", file=sys.stderr)
+                sys.exit(1)
+            align_tol = getattr(args, "align_tolerance", None)
+            result = detect_split_frame(frame, SPLIT_CFG)
+            label = str(result.get("label", "single"))
+            ok = _is_detected_label(label)
+            mse_dict = {
+                "detected": 1.0 if ok else 0.0,
+                "boundary_count": float(len(result.get("boundaries", []))),
+                "peak_count": float(len(result.get("peak_x", []))),
+            }
+            debug_dir = (args.debug_dir.resolve() if args.debug_dir is not None else Path.cwd() / "debug")
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            # 파일명: 원본_640p_00-45-10-312 (scale 없으면 원본_00-45-10-312)
+            prefix_parts = [path.stem]
+            if scale_w is not None:
+                prefix_parts.append(f"{scale_w}p")
+            prefix_parts.append(_ts_to_export_fname(time_sec))
+            debug_export_prefix = "_".join(prefix_parts)
+            if CV2_AVAILABLE:
+                _export_verify_frames(frame, time_sec, ok, mse_dict, compare_mode, debug_dir, export_prefix=debug_export_prefix)
+                detector_debug = render_debug_overlay(frame, result)
+                det_debug_path = debug_dir / f"{debug_export_prefix}_detector_overlay.jpg"
+                cv2.imwrite(str(det_debug_path), detector_debug)
+                print(f"신규 알고리즘 디버그 오버레이 저장: {det_debug_path}")
+            verdict_kr = "분할 감지 성공" if ok else "분할 감지 실패(single)"
+            print(f"시점: {format_ts(time_sec)}  →  {verdict_kr}")
+            print(f"label: {label}")
+            print(f"boundaries: {result.get('boundaries', [])}, peaks: {result.get('peak_x', [])}")
+            print(f"reason: {result.get('reason', '')}")
+            print(f"디버그 이미지 저장: {debug_dir}")
+
+            # --edge-fallback 시 해당 시점에서 엣지 기반 삼분할/이분할 결과도 별도 이미지로 저장 (오탐 분석용)
+            if getattr(args, "edge_fallback", False) and CV2_AVAILABLE:
+                try:
+                    from test.edge_check_ver1_down_scale import (
+                        fast_edge_check_bipartite,
+                        fast_edge_check_v3,
+                        verify_left_center_right_tripartite,
+                        verify_left_right_duplicate,
+                    )
+                except ImportError:
+                    pass
+                else:
+                    frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    scale_for_threshold = scale_w if scale_w is not None else frame.shape[1]
+                    if scale_for_threshold <= 480:
+                        threshold_mult = 3.5
+                    elif scale_for_threshold <= 640:
+                        threshold_mult = 4.0
+                    elif scale_for_threshold <= 960:
+                        threshold_mult = 4.5
+                    else:
+                        threshold_mult = 5.0
+
+                    h, w = frame.shape[:2]
+
+                    # 1) 엣지 기반 삼분할 전용 이미지 (w/3, 2w/3 경계 + 패치 검증 디테일)
+                    tri_img = frame.copy()
+                    is_tri_edge, p_l, p_r = fast_edge_check_v3(
+                        frame_gray,
+                        40,
+                        threshold_mult,
+                        time_sec=time_sec,
+                        verify_duplicate=EDGE_VERIFY_TRIPARTITE_DUPLICATE,
+                        duplicate_similarity_threshold=EDGE_DUPLICATE_SIMILARITY_THRESHOLD,
+                    )
+                    # 패치 유사도 디테일 (성공/실패 이유)
+                    if p_l is not None and p_r is not None and p_r > p_l:
+                        tri_verified, tri_detail = verify_left_center_right_tripartite(
+                            frame_gray,
+                            p_l,
+                            p_r,
+                            similarity_threshold=EDGE_DUPLICATE_SIMILARITY_THRESHOLD,
+                        )
+                    else:
+                        tri_verified, tri_detail = False, "invalid peaks"
+
+                    if is_tri_edge:
+                        tri_color = (0, 255, 0)
+                        cv2.line(tri_img, (p_l, 0), (p_l, h), tri_color, 3)
+                        cv2.line(tri_img, (p_r, 0), (p_r, h), tri_color, 3)
+                        status_tri = f"Edge tripartite: OK | L={p_l}, R={p_r}, gap={p_r - p_l}px"
+                    else:
+                        tri_color = (0, 0, 255)
+                        cv2.line(tri_img, (p_l, 0), (p_l, h), tri_color, 2)
+                        cv2.line(tri_img, (p_r, 0), (p_r, h), tri_color, 2)
+                        status_tri = "Edge tripartite: NG"
+                    cv2.putText(
+                        tri_img,
+                        status_tri,
+                        (10, h - 40),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        tri_color,
+                        2,
+                    )
+                    # 두 번째 줄에 패치 검증 디테일
+                    cv2.putText(
+                        tri_img,
+                        f"detail: {tri_detail}",
+                        (10, h - 15),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        tri_color,
+                        2,
+                    )
+                    tri_path = debug_dir / f"{debug_export_prefix}_edge_tripartite.jpg"
+                    cv2.imwrite(str(tri_path), tri_img)
+                    print(f"엣지 삼분할 디버그 이미지 저장: {tri_path}")
+
+                    # 2) 엣지 기반 이분할 전용 이미지 (중앙 경계 + half/패치 디테일)
+                    bi_img = frame.copy()
+                    is_bi_edge, p_center = fast_edge_check_bipartite(
+                        frame_gray,
+                        40,
+                        threshold_mult,
+                        time_sec=time_sec,
+                        verify_duplicate=EDGE_VERIFY_BIPARTITE_DUPLICATE,
+                        duplicate_similarity_threshold=EDGE_DUPLICATE_SIMILARITY_THRESHOLD,
+                    )
+                    # half/패치 검증 디테일
+                    if p_center is not None:
+                        bi_verified, bi_detail = verify_left_right_duplicate(
+                            frame_gray,
+                            center=p_center,
+                            similarity_threshold=EDGE_DUPLICATE_SIMILARITY_THRESHOLD,
+                        )
+                    else:
+                        bi_verified, bi_detail = False, "invalid center"
+
+                    if is_bi_edge:
+                        bi_color = (0, 255, 0)
+                        cv2.line(bi_img, (p_center, 0), (p_center, h), bi_color, 3)
+                        cv2.putText(
+                            bi_img,
+                            f"C={p_center}",
+                            (p_center + 5, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6,
+                            bi_color,
+                            2,
+                        )
+                        status_bi = f"Edge bipartite: OK | center={p_center}px"
+                    else:
+                        bi_color = (0, 0, 255)
+                        center_guess = w // 2
+                        cv2.line(bi_img, (center_guess, 0), (center_guess, h), bi_color, 2)
+                        status_bi = "Edge bipartite: NG"
+                    cv2.putText(
+                        bi_img,
+                        status_bi,
+                        (10, h - 40),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        bi_color,
+                        2,
+                    )
+                    cv2.putText(
+                        bi_img,
+                        f"detail: {bi_detail}",
+                        (10, h - 15),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        bi_color,
+                        2,
+                    )
+                    bi_path = debug_dir / f"{debug_export_prefix}_edge_bipartite.jpg"
+                    cv2.imwrite(str(bi_path), bi_img)
+                    print(f"엣지 이분할 디버그 이미지 저장: {bi_path}")
+            return
+
+        # --segments-in: 파일에서 구간 목록 읽어서 출력·병합만 (검출 생략)
+        if segments_in is not None:
+            seg_file = (
+                path.parent / (path.stem + "_seg.txt")
+                if segments_in is True
+                else Path(segments_in).resolve()
+            )
+            if not seg_file.is_file():
+                print(f"[오류] 구간 목록 파일을 찾을 수 없습니다: {seg_file}", file=sys.stderr)
+                sys.exit(1)
+            try:
+                segments = load_segments_from_file(seg_file)
+            except FileNotFoundError as e:
+                print(f"[오류] {e}", file=sys.stderr)
+                sys.exit(1)
+            segments = merge_adjacent_segments(segments)
+            if not segments:
+                print("[오류] 구간 목록 파일에 유효한 구간이 없습니다.", file=sys.stderr)
+                sys.exit(1)
+            print(f"입력: {path}")
+            print(f"구간 목록: {seg_file}  (총 {len(segments)}개)")
+            print("검출된 구간:")
+            total_length_sec = 0.0
+            for i, (start, end) in enumerate(segments, 1):
+                seg_len = end - start
+                total_length_sec += seg_len
+                print(f"  [{i}] {format_ts(start)} ~ {format_ts(end)}  (길이 {seg_len:.1f}초)")
+            print("-" * 50)
+            print(f"길이 총합: {total_length_sec:.1f}초  ({_format_elapsed(total_length_sec)})")
+            if args.merge is not None:
+                output_path = (
+                    Path(args.merge).resolve()
+                    if args.merge is not True
+                    else _merge_output_path_for_input(path)
+                )
+                merge_workers = getattr(args, "merge_workers", 2)
+                print(f"구간 병합 중... (코덱 카피, merge-workers={merge_workers}) → {output_path}", flush=True)
+                if not merge_segments(path, segments, output_path, use_gpu, merge_workers=merge_workers, merge_notify=args.merge_notify):
+                    sys.exit(1)
+                print(f"전체 실행(시작~완료): {_format_elapsed(time.perf_counter() - run_start_wall)}", flush=True)
+            return
+
+        print(f"입력: {path}")
+        meta_start = time.perf_counter()
+        try:
+            duration, width, height = get_video_info(path)
+        except RuntimeError as e:
+            print(f"[오류] {e}", file=sys.stderr)
+            sys.exit(1)
+        meta_elapsed = time.perf_counter() - meta_start
+
+        # --verify: 지정 구간만 샘플링해 삼분할 여부·MSE 리포팅 후 종료
+        if args.verify is not None:
+            try:
+                start_sec = parse_ts_to_sec(args.verify[0])
+                end_sec = parse_ts_to_sec(args.verify[1])
+            except ValueError as e:
+                print(f"[오류] {e}", file=sys.stderr)
+                sys.exit(1)
+            interval = max(0.5, getattr(args, "verify_interval", 5.0))
+            print(f"길이: {format_ts(duration)} ({duration:.1f}초), 해상도: {width}x{height}")
+            print(f"비교 영역: 높이 {Y_CROP_RATIO_START*100:.0f}% ~ {Y_CROP_RATIO_END*100:.0f}%, 모드: {_compare_mode_label_kr(compare_mode)}")
+            print("-" * 50)
+            verify_segment(
+                path, start_sec, end_sec, width, height,
+                interval, compare_mode, use_gpu,
+                export_dir=getattr(args, "verify_export", None),
+                export_max=max(0, getattr(args, "verify_export_max", 20)),
+                export_only_x=getattr(args, "verify_export_only_x", False),
+                align_tolerance_px=args.align_tolerance,
+            )
+            return
+
+        run_start = time.perf_counter()
+        min_dur = 0.0 if args.no_min_duration else MIN_SEGMENT_DURATION
+        coarse = max(1.0, args.coarse_interval)
+        workers = max(0, args.workers)
+        print(f"길이: {format_ts(duration)} ({duration:.1f}초), 해상도: {width}x{height}")
+        print(f"비교 영역: 높이 {Y_CROP_RATIO_START*100:.0f}% ~ {Y_CROP_RATIO_END*100:.0f}% (상단 팝업 제외)")
+        print(f"모드: {_compare_mode_label_kr(compare_mode)}")
+        gpu_desc = "GPU(CUDA 디코딩" + (", CuPy 판정" if CUPY_AVAILABLE else "") + ")" if use_gpu else "CPU"
+        coarse_scale = getattr(args, "coarse_scale", None)
+        coarse_scale = coarse_scale if coarse_scale in COARSE_SCALE_WIDTHS else None
+        coarse_res_str = ""
+        if coarse_scale is not None:
+            coarse_h = round(height * coarse_scale / width)
+            coarse_res_str = f", 코스 해상도 {coarse_scale}×{coarse_h} (저해상도)"
+        print(f"코스 스캔: 간격 {coarse}s, 병렬 프로세스 {workers}개, 자원 {gpu_desc}{coarse_res_str}")
+        print("-" * 50)
+
+        use_coarse_cache = getattr(args, "coarse_cache", False)
+        use_edge_fallback = getattr(args, "edge_fallback", False)
+        # --edge-fallback 시 유사도·패치 검증 옵션 (test/edge_check_ver1_down_scale 방식)
+        if use_edge_fallback:
+            EDGE_VERIFY_TRIPARTITE_DUPLICATE = not getattr(args, "no_verify_edge_tripartite", False)
+            EDGE_VERIFY_BIPARTITE_DUPLICATE = not getattr(args, "no_verify_edge_duplicate", False)
+            EDGE_DUPLICATE_SIMILARITY_THRESHOLD = getattr(args, "edge_duplicate_threshold", EDGE_DUPLICATE_SIMILARITY_THRESHOLD)
+        segments, phase_timings = find_segments(
+            path, duration, width, height,
+            min_duration_sec=min_dur,
+            coarse_interval_sec=coarse,
+            compare_mode=compare_mode,
+            n_workers=workers,
+            use_gpu=use_gpu,
+            coarse_scale_width=coarse_scale,
+            use_coarse_cache=use_coarse_cache,
+            boundary_tolerance_sec=args.boundary_tolerance,
+            align_tolerance_px=args.align_tolerance,
+            use_edge_fallback=use_edge_fallback,
+            edge_verify_tripartite=EDGE_VERIFY_TRIPARTITE_DUPLICATE,
+            edge_verify_bipartite=EDGE_VERIFY_BIPARTITE_DUPLICATE,
+            edge_duplicate_threshold=EDGE_DUPLICATE_SIMILARITY_THRESHOLD,
+        )
+
+        run_elapsed = time.perf_counter() - run_start
+        # 파이프라인 단계별 소요 시간 요약 (효율화 분석용)
+        all_phases = [
+            "메타(ffprobe)",
+            "시점 목록",
+            "코스 스캔",
+            "코스 정렬",
+            "후보 구간 수집",
+            "경계 정밀화",
+            "병합",
+            "최소 길이 필터",
+        ]
+        full_timings: dict[str, float] = {"메타(ffprobe)": meta_elapsed, **phase_timings}
+        total_sec = sum(full_timings.get(p, 0.0) for p in all_phases)
+        if total_sec <= 0:
+            total_sec = run_elapsed
+        name_width = max(len(p) for p in all_phases)
+        time_width = 10  # "123.45초" 또는 "12분 34초" 수준
+        print("소요 시간 요약 (파이프라인):")
+        for name in all_phases:
+            sec = full_timings.get(name, 0.0)
+            if sec <= 0 and name != "메타(ffprobe)":
+                continue
+            pct = (sec / total_sec * 100) if total_sec > 0 else 0
+            print(f"  {name:<{name_width}}  {_format_elapsed(sec):>{time_width}}  ({pct:>5.1f}%)", flush=True)
+        print(f"  {'─ 합계':<{name_width}}  {_format_elapsed(total_sec):>{time_width}}  (전체 실행: {_format_elapsed(run_elapsed)})", flush=True)
+        print("-" * 50)
+
+        if not segments:
+            print("검출된 구간이 없습니다.")
+            return
+
+        print("검출된 구간:")
+        total_length_sec = 0.0
+        for i, (start, end) in enumerate(segments, 1):
+            seg_len = end - start
+            total_length_sec += seg_len
+            print(f"  [{i}] {format_ts(start)} ~ {format_ts(end)}  (길이 {seg_len:.1f}초)")
+        print("-" * 50)
+        print(f"총 {len(segments)}개 구간  (전체 소요: {_format_elapsed(run_elapsed)})")
+        print(f"길이 총합: {total_length_sec:.1f}초  ({_format_elapsed(total_length_sec)})")
+
+        if segments_out is not None:
+            out_path = (
+                _seg_output_path_for_input(path)
+                if segments_out is True
+                else Path(segments_out).resolve()
+            )
+            write_segments_to_file(segments, out_path)
+            print(f"구간 목록 저장: {out_path}  (편집 후 --segments-in으로 읽어 병합 가능)", flush=True)
+
+        if args.merge is not None:
+            output_path = (
+                Path(args.merge).resolve()
+                if args.merge is not True
+                else _merge_output_path_for_input(path)
+            )
+            merge_workers = getattr(args, "merge_workers", 2)
+            print(f"구간 병합 중... (코덱 카피, merge-workers={merge_workers}) → {output_path}", flush=True)
+            if not merge_segments(path, segments, output_path, use_gpu, merge_workers=merge_workers, merge_notify=args.merge_notify):
+                sys.exit(1)
+            else:
+                print(f"전체 실행(시작~완료): {_format_elapsed(time.perf_counter() - run_start_wall)}", flush=True)
+    finally:
+        try:
+            log_file.flush()
+            log_file.close()
+        finally:
+            sys.stdout = _orig_stdout
+            sys.stderr = _orig_stderr
+
+
+if __name__ == "__main__":
+    main()
